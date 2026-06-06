@@ -1,0 +1,55 @@
+{
+  "name": "chatbridge",
+  "version": "1.0.0",
+  "description": "Local TUI/CLI bridge for Copilot, Codex, and Claude Code chat histories",
+  "license": "MIT",
+  "type": "commonjs",
+  "homepage": "https://github.com/ylexLiao/chatbridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ylexLiao/chatbridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ylexLiao/chatbridge/issues"
+  },
+  "keywords": [
+    "copilot",
+    "codex",
+    "claude",
+    "chat-history",
+    "tui",
+    "migration",
+    "developer-tools"
+  ],
+  "bin": {
+    "chatbridge": "bin/chatbridge"
+  },
+  "files": [
+    "bin/chatbridge",
+    "chatbridge/*.py",
+    "docs/assets/**",
+    "install.sh",
+    "install.ps1",
+    "scripts/postinstall.js",
+    "rust/chatbridge-tui/Cargo.toml",
+    "rust/chatbridge-tui/Cargo.lock",
+    "rust/chatbridge-tui/src/**",
+    "README.zh-CN.md",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "test": "python3 -m unittest discover -s tests -v",
+    "build:tui": "cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release",
+    "test:rust": "cargo test --manifest-path rust/chatbridge-tui/Cargo.toml",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ]
+}

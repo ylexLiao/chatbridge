@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Python tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Rust tests
+        shell: bash
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          set -o pipefail
+          cargo test --manifest-path rust/chatbridge-tui/Cargo.toml -- --test-threads=1 --nocapture 2>&1 | tee rust-test.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            message="$(tail -n 80 rust-test.log | sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g')"
+            echo "::error title=Rust tests failed::$message"
+            exit "$status"
+          fi
+
+      - name: Build TUI
+        run: cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release
+
+      - name: npm pack dry run
+        run: npm pack --dry-run
+
+      - name: npm install from package tarball
+        run: |
+          mkdir -p "$RUNNER_TEMP/chatbridge-pack"
+          TARBALL="$(npm pack --pack-destination "$RUNNER_TEMP/chatbridge-pack" | tail -n 1)"
+          npm_config_prefix="$RUNNER_TEMP/npm-global" npm install -g "$RUNNER_TEMP/chatbridge-pack/$TARBALL"
+          "$RUNNER_TEMP/npm-global/bin/chatbridge" --help

@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to publish"
+        required: true
+        default: "v1.0.0"
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: chatbridge-linux-x64
+            binary: chatbridge-tui
+            archive: tar.gz
+            rust_target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            asset: chatbridge-linux-arm64
+            binary: chatbridge-tui
+            archive: tar.gz
+            rust_target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            asset: chatbridge-windows-x64
+            binary: chatbridge-tui.exe
+            archive: zip
+            rust_target: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Install musl tools
+        if: contains(matrix.rust_target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools binutils
+
+      - name: Build TUI
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_target="${{ matrix.rust_target }}"
+          build_dir="rust/chatbridge-tui/target/release"
+          target_args=()
+          if [ -n "$rust_target" ]; then
+            target_args=(--target "$rust_target")
+            build_dir="rust/chatbridge-tui/target/$rust_target/release"
+          fi
+          cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release "${target_args[@]}"
+          echo "CHATBRIDGE_BUILD_DIR=$build_dir" >> "$GITHUB_ENV"
+
+      - name: Prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist package
+          mkdir -p package/chatbridge/bin dist
+          cp -R chatbridge package/chatbridge/
+          cp -R docs package/chatbridge/
+          cp README.md README.zh-CN.md LICENSE package/chatbridge/
+          cp "$CHATBRIDGE_BUILD_DIR/${{ matrix.binary }}" package/chatbridge/bin/
+
+      - name: Check packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="package/chatbridge/bin/${{ matrix.binary }}"
+          test -f "$binary"
+          case "${{ runner.os }}" in
+            Windows) ;;
+            *) test -x "$binary" ;;
+          esac
+          file "$binary" || true
+
+      - name: Smoke packaged TUI
+        if: runner.os != 'macOS'
+        shell: bash
+        run: CHATBRIDGE_TUI_SMOKE=1 "package/chatbridge/bin/${{ matrix.binary }}"
+
+      - name: Verify Linux binary is static
+        if: contains(matrix.rust_target, 'linux-musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="package/chatbridge/bin/${{ matrix.binary }}"
+          file "$binary"
+          if readelf -l "$binary" | grep -q 'Requesting program interpreter'; then
+            echo "Linux release binary is dynamically linked; rebuild it as static musl." >&2
+            exit 1
+          fi
+
+      - name: Archive tarball
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C package -czf "dist/${{ matrix.asset }}.tar.gz" chatbridge
+
+      - name: Archive zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path package/chatbridge -DestinationPath "dist/${{ matrix.asset }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  build-macos:
+    name: Build macOS release assets
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build and package macOS assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist package-*
+          mkdir -p dist
+
+          build_asset() {
+            local target="$1"
+            local asset="$2"
+            local package_dir="package-$asset"
+            local binary="rust/chatbridge-tui/target/$target/release/chatbridge-tui"
+
+            cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release --target "$target"
+
+            mkdir -p "$package_dir/chatbridge/bin"
+            cp -R chatbridge "$package_dir/chatbridge/"
+            cp -R docs "$package_dir/chatbridge/"
+            cp README.md README.zh-CN.md LICENSE "$package_dir/chatbridge/"
+            cp "$binary" "$package_dir/chatbridge/bin/"
+
+            test -x "$package_dir/chatbridge/bin/chatbridge-tui"
+            file "$package_dir/chatbridge/bin/chatbridge-tui"
+            tar -C "$package_dir" -czf "dist/$asset.tar.gz" chatbridge
+          }
+
+          build_asset aarch64-apple-darwin chatbridge-macos-arm64
+          build_asset x86_64-apple-darwin chatbridge-macos-x64
+
+      - name: Smoke host-compatible macOS binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) asset=chatbridge-macos-arm64 ;;
+            x86_64) asset=chatbridge-macos-x64 ;;
+            *) echo "Unsupported macOS runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          rm -rf smoke
+          mkdir smoke
+          tar -xzf "dist/$asset.tar.gz" -C smoke
+          CHATBRIDGE_TUI_SMOKE=1 smoke/chatbridge/bin/chatbridge-tui
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: chatbridge-macos
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - build
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add installer scripts
+        run: |
+          cp install.sh install.ps1 dist/
+          ls -la dist
+
+      - name: Remove stale release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for asset in \
+            chatbridge-macos-arm64.tar.gz \
+            chatbridge-macos-x64.tar.gz
+          do
+            gh release delete-asset "$RELEASE_TAG" "$asset" --yes || true
+          done
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          overwrite_files: true
+          generate_release_notes: true

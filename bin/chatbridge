@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+"use strict";
+
+const childProcess = require("child_process");
+const path = require("path");
+
+const root = path.resolve(__dirname, "..");
+const python = process.env.PYTHON || process.env.PYTHON3 || (process.platform === "win32" ? "python" : "python3");
+const env = { ...process.env };
+env.PYTHONPATH = root + (env.PYTHONPATH ? path.delimiter + env.PYTHONPATH : "");
+const bootstrap = [
+  "import runpy",
+  "import sys",
+  "sys.path.insert(0, sys.argv.pop(1))",
+  "runpy.run_module('chatbridge', run_name='__main__', alter_sys=True)",
+].join("; ");
+
+const child = childProcess.spawn(python, ["-c", bootstrap, root, ...process.argv.slice(2)], {
+  env,
+  stdio: "inherit",
+});
+
+child.on("exit", (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(code ?? 1);
+});
+
+child.on("error", (error) => {
+  console.error(`chatbridge launcher error: ${error.message}`);
+  process.exit(1);
+});
