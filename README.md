@@ -54,6 +54,13 @@ chatbridge
 Release installers download a prebuilt Rust TUI for your platform. Users do not need Rust or Cargo for this path.
 On macOS and Linux, the installer places the `chatbridge` launcher in a writable bin directory already on your `PATH` when possible; otherwise it falls back to `~/.local/bin` and prints the `PATH` line to add. On Windows, the installer updates the current PowerShell session's `PATH` when needed so the next `chatbridge` command can run immediately.
 
+Update an existing release-installer install:
+
+```bash
+chatbridge update
+chatbridge --version
+```
+
 Prebuilt release assets currently target macOS arm64/x64, Linux arm64/x64, and Windows x64. Linux release binaries are built with musl to avoid requiring a newer system glibc. Other platforms can use the source build path.
 
 | Platform | Prebuilt asset | Requirement |
@@ -94,7 +101,7 @@ Source builds require Rust/Cargo.
 
 ### Homebrew
 
-Homebrew support is planned after the first release checksum is available. The formula template is in [packaging/homebrew/chatbridge.rb](packaging/homebrew/chatbridge.rb).
+Homebrew tap publishing is planned. The repository currently includes a formula template in [packaging/homebrew/chatbridge.rb](packaging/homebrew/chatbridge.rb), but `brew install chatbridge` / `brew upgrade chatbridge` are not published commands yet.
 
 ## Uninstall
 
@@ -162,6 +169,8 @@ chatbridge native-import --from claude --to copilot --session <session-id> --pro
 | Claude Code | Yes | Yes | `~/.claude/history.jsonl`, project transcript JSONL |
 
 ## Path Setup
+
+Inside the TUI, press `P` to open the path setup form. Choose the target path, type the directory, and press `Enter` to save it.
 
 ```bash
 chatbridge paths doctor

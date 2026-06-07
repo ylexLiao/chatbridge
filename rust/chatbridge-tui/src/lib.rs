@@ -374,6 +374,61 @@ impl Target {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathTarget {
+    CopilotWorkspaceStorage,
+    CodexHome,
+    ClaudeHome,
+}
+
+impl PathTarget {
+    fn all() -> [PathTarget; 3] {
+        [
+            PathTarget::CopilotWorkspaceStorage,
+            PathTarget::CodexHome,
+            PathTarget::ClaudeHome,
+        ]
+    }
+
+    fn api_arg(self) -> &'static str {
+        match self {
+            PathTarget::CopilotWorkspaceStorage => "--copilot-workspace-storage",
+            PathTarget::CodexHome => "--codex-home",
+            PathTarget::ClaudeHome => "--claude-home",
+        }
+    }
+
+    fn label_for(self, language: Language) -> &'static str {
+        if language == Language::Chinese {
+            return match self {
+                PathTarget::CopilotWorkspaceStorage => "Copilot workspaceStorage",
+                PathTarget::CodexHome => "Codex 主目录",
+                PathTarget::ClaudeHome => "Claude 主目录",
+            };
+        }
+        match self {
+            PathTarget::CopilotWorkspaceStorage => "Copilot workspaceStorage",
+            PathTarget::CodexHome => "Codex home",
+            PathTarget::ClaudeHome => "Claude home",
+        }
+    }
+
+    fn hint_for(self, language: Language) -> &'static str {
+        if language == Language::Chinese {
+            return match self {
+                PathTarget::CopilotWorkspaceStorage => "VS Code/Cursor 的 workspaceStorage 目录",
+                PathTarget::CodexHome => "通常是 ~/.codex",
+                PathTarget::ClaudeHome => "通常是 ~/.claude",
+            };
+        }
+        match self {
+            PathTarget::CopilotWorkspaceStorage => "VS Code/Cursor workspaceStorage directory",
+            PathTarget::CodexHome => "Usually ~/.codex",
+            PathTarget::ClaudeHome => "Usually ~/.claude",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Home,
     Loading,
@@ -382,6 +437,7 @@ pub enum View {
     Target,
     ConfirmNative,
     ConfirmDuplicate,
+    PathSetup,
     Result,
 }
 
@@ -534,6 +590,10 @@ pub enum UiCommand {
         allow_duplicate: bool,
     },
     PathsDoctor,
+    SetPath {
+        target: PathTarget,
+        value: String,
+    },
 }
 
 #[derive(Debug)]
@@ -542,6 +602,7 @@ pub enum WorkerResult {
     Handoff(ApiResult<String>),
     Native(ApiResult<String>),
     Paths(ApiResult<String>),
+    PathSet(ApiResult<String>),
 }
 
 #[derive(Debug)]
@@ -564,6 +625,8 @@ pub struct App {
     filter: String,
     filter_input: String,
     filtering: bool,
+    path_index: usize,
+    path_input: String,
     loading_message: String,
     result_title: String,
     result_text: String,
@@ -597,6 +660,8 @@ impl App {
             filter: String::new(),
             filter_input: String::new(),
             filtering: false,
+            path_index: 0,
+            path_input: String::new(),
             loading_message: "Ready".to_string(),
             result_title: "Result".to_string(),
             result_text: String::new(),
@@ -629,6 +694,11 @@ impl App {
     fn target(&self) -> Target {
         let targets = Target::available_for(self.source());
         targets[self.target_index % targets.len()]
+    }
+
+    fn path_target(&self) -> PathTarget {
+        let targets = PathTarget::all();
+        targets[self.path_index % targets.len()]
     }
 
     fn selected_session(&self) -> Option<&SessionRow> {
@@ -765,6 +835,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> UiCommand {
     if app.filtering {
         return handle_filter_key(app, key);
     }
+    if app.view == View::PathSetup {
+        return handle_path_setup_key(app, key);
+    }
     if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
         app.language = app.language.toggle();
         return UiCommand::None;
@@ -776,6 +849,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> UiCommand {
         View::Target => handle_target_key(app, key),
         View::ConfirmNative => handle_confirm_native_key(app, key),
         View::ConfirmDuplicate => handle_confirm_duplicate_key(app, key),
+        View::PathSetup => handle_path_setup_key(app, key),
         View::Result => handle_result_key(app, key),
         View::Loading => UiCommand::None,
     }
@@ -787,6 +861,13 @@ fn show_result(app: &mut App, title: impl Into<String>, text: impl Into<String>,
     app.result_scroll = 0;
     app.result_back_view = back_view;
     app.view = View::Result;
+}
+
+fn open_path_setup(app: &mut App) {
+    app.action_index = 3;
+    app.view = View::PathSetup;
+    app.path_index = app.path_index.min(PathTarget::all().len() - 1);
+    app.path_input.clear();
 }
 
 fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
@@ -833,8 +914,8 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
             }
         }
         KeyCode::Char('p') => {
-            app.action_index = 3;
-            UiCommand::PathsDoctor
+            open_path_setup(app);
+            UiCommand::None
         }
         KeyCode::Enter => match app.action() {
             ChatAction::Recent | ChatAction::Handoff | ChatAction::Native => {
@@ -845,7 +926,10 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
                     preserve_filter: false,
                 }
             }
-            ChatAction::Paths => UiCommand::PathsDoctor,
+            ChatAction::Paths => {
+                open_path_setup(app);
+                UiCommand::None
+            }
         },
         _ => UiCommand::None,
     }
@@ -1085,6 +1169,49 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> UiCommand {
     }
 }
 
+fn handle_path_setup_key(app: &mut App, key: KeyEvent) -> UiCommand {
+    match key.code {
+        KeyCode::Esc => {
+            app.view = View::Home;
+            UiCommand::None
+        }
+        KeyCode::Up => {
+            app.path_index = app.path_index.saturating_sub(1);
+            UiCommand::None
+        }
+        KeyCode::Down => {
+            app.path_index = (app.path_index + 1).min(PathTarget::all().len() - 1);
+            UiCommand::None
+        }
+        KeyCode::Char('?') => UiCommand::PathsDoctor,
+        KeyCode::Enter => {
+            let value = app.path_input.trim().to_string();
+            if value.is_empty() {
+                show_result(
+                    app,
+                    "Path Setup",
+                    "Type a path before saving.",
+                    View::PathSetup,
+                );
+                return UiCommand::None;
+            }
+            UiCommand::SetPath {
+                target: app.path_target(),
+                value,
+            }
+        }
+        KeyCode::Backspace => {
+            app.path_input.pop();
+            UiCommand::None
+        }
+        KeyCode::Char(value) => {
+            app.path_input.push(value);
+            UiCommand::None
+        }
+        _ => UiCommand::None,
+    }
+}
+
 pub fn begin_command(app: &mut App, command: UiCommand) {
     let home = app.home.clone();
     let (tx, rx) = mpsc::channel();
@@ -1131,6 +1258,12 @@ pub fn begin_command(app: &mut App, command: UiCommand) {
                 let _ = tx.send(WorkerResult::Paths(result));
             });
         }
+        UiCommand::SetPath { target, value } => {
+            thread::spawn(move || {
+                let result = api_set_path(&home, target, &value);
+                let _ = tx.send(WorkerResult::PathSet(result));
+            });
+        }
         UiCommand::None | UiCommand::Quit => {
             app.worker_rx = None;
         }
@@ -1169,6 +1302,10 @@ pub fn prepare_loading(app: &mut App, command: &UiCommand) {
         }
         UiCommand::PathsDoctor => {
             app.loading_message = "Inspecting history paths...".to_string();
+            app.view = View::Loading;
+        }
+        UiCommand::SetPath { target, .. } => {
+            app.loading_message = format!("Saving {} override...", target.label_for(app.language));
             app.view = View::Loading;
         }
         UiCommand::None | UiCommand::Quit => {}
@@ -1221,6 +1358,10 @@ pub fn apply_worker_result(app: &mut App, result: WorkerResult) {
         WorkerResult::Paths(Ok(text)) => {
             show_result(app, "Path Doctor", text, View::Home);
         }
+        WorkerResult::PathSet(Ok(text)) => {
+            app.path_input.clear();
+            show_result(app, "Path Setup", text, View::PathSetup);
+        }
         WorkerResult::Native(Err(error)) if error.kind == "duplicate" => {
             app.duplicate_message = error.message;
             app.duplicate_next_title = error.next_title.unwrap_or_else(|| "next copy".to_string());
@@ -1235,6 +1376,9 @@ pub fn apply_worker_result(app: &mut App, result: WorkerResult) {
         }
         WorkerResult::Paths(Err(error)) => {
             show_result(app, "Error", error.message, View::Home);
+        }
+        WorkerResult::PathSet(Err(error)) => {
+            show_result(app, "Error", error.message, View::PathSetup);
         }
     }
     app.clamp_selection();
@@ -1310,6 +1454,11 @@ fn api_native_import(
 
 fn api_paths(home: &PathBuf) -> ApiResult<String> {
     let data: TextData = call_api(home, &["api", "paths", "doctor"])?;
+    Ok(data.text)
+}
+
+fn api_set_path(home: &PathBuf, target: PathTarget, value: &str) -> ApiResult<String> {
+    let data: TextData = call_api(home, &["api", "paths", "set", target.api_arg(), value])?;
     Ok(data.text)
 }
 
@@ -1497,6 +1646,7 @@ fn render_right(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         View::SessionPreview => render_sessions(frame, app, area),
         View::Target => render_target(frame, app, area),
         View::ConfirmNative => render_confirm_native(frame, app, area),
+        View::PathSetup => render_path_setup(frame, app, area),
         View::Result => render_result(frame, app, area),
         View::Loading | View::ConfirmDuplicate => render_home(frame, app, area),
     }
@@ -1676,6 +1826,58 @@ fn render_confirm_native(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(content_block(" Confirm ", lines), area);
 }
 
+fn render_path_setup(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            text(app.language, "Path Setup", "路径设置"),
+            accent_style(),
+        )),
+        Line::from(""),
+    ];
+    for (index, target) in PathTarget::all().iter().enumerate() {
+        let style = if index == app.path_index {
+            selected_style()
+        } else {
+            inactive_chip_style()
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!(" {} ", target.label_for(app.language)), style),
+            Span::raw("  "),
+            Span::styled(target.hint_for(app.language), subtle_style()),
+        ]));
+    }
+    let input = if app.path_input.is_empty() {
+        text(app.language, "<type path here>", "<在这里输入路径>").to_string()
+    } else {
+        app.path_input.clone()
+    };
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            text(app.language, "Input", "输入"),
+            label_style(),
+        )),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!(" {input} "), selected_style()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            text(
+                app.language,
+                "Saved overrides are written to ~/.chatbridge/config.json.",
+                "保存后的覆盖路径会写入 ~/.chatbridge/config.json。",
+            ),
+            subtle_style(),
+        )),
+    ]);
+    frame.render_widget(
+        content_block(text(app.language, " Paths ", " 路径 "), lines),
+        area,
+    );
+}
+
 fn render_session_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, area);
     let Some(session) = app.selected_session() else {
@@ -1803,6 +2005,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             app.language,
             "NAV  Left/Right choice  Enter confirm  T language  Esc cancel",
             "导航  左/右 选择  Enter 确认  T 语言  Esc 取消",
+        ),
+        View::PathSetup => text(
+            app.language,
+            "NAV  Up/Down target  Type path  Enter save  ? doctor  Esc back",
+            "导航  上/下 目标  输入路径  Enter 保存  ? 诊断  Esc 返回",
         ),
         View::Result => text(
             app.language,
@@ -2432,7 +2639,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/tmp/home"));
 
         let buffer = render_buffer(&mut app, 110, 30);
-        assert!(buffer.contains("v1.0.0"));
+        assert!(buffer.contains("v1.0.1"));
 
         let _ = handle_key(&mut app, key(KeyCode::Char('t')));
         let buffer = render_buffer(&mut app, 110, 30);
@@ -2521,6 +2728,51 @@ mod tests {
         assert_eq!(app.view(), &View::Result);
         let _ = handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(app.view(), &View::Home);
+    }
+
+    #[test]
+    fn path_action_opens_direct_path_setup_form() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.action_index = 3;
+
+        let command = handle_key(&mut app, key(KeyCode::Enter));
+
+        assert!(matches!(command, UiCommand::None));
+        assert_eq!(app.view(), &View::PathSetup);
+        let buffer = render_buffer(&mut app, 110, 30);
+        assert!(buffer.contains("Copilot workspaceStorage"));
+        assert!(buffer.contains("Codex home"));
+        assert!(buffer.contains("Claude home"));
+    }
+
+    #[test]
+    fn path_setup_accepts_input_and_saves_selected_target() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        open_path_setup(&mut app);
+        let _ = handle_key(&mut app, key(KeyCode::Down));
+        for ch in "/tmp/custom-codex".chars() {
+            let _ = handle_key(&mut app, key(KeyCode::Char(ch)));
+        }
+
+        let command = handle_key(&mut app, key(KeyCode::Enter));
+
+        match command {
+            UiCommand::SetPath { target, value } => {
+                assert_eq!(target, PathTarget::CodexHome);
+                assert_eq!(value, "/tmp/custom-codex");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_setup_question_mark_runs_doctor() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        open_path_setup(&mut app);
+
+        let command = handle_key(&mut app, key(KeyCode::Char('?')));
+
+        assert!(matches!(command, UiCommand::PathsDoctor));
     }
 
     #[test]

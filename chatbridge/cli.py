@@ -4,9 +4,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import __version__
 from .parsers import SUPPORTED_SOURCES, find_session, load_sessions
 from .paths import edit_path_overrides, path_doctor, set_path_overrides
 from .summary import build_handoff
+from .update import update_release_install
 from .writers import native_import, repair_claude_imports, repair_codex_imports, repair_copilot_imports
 from .api import add_api_parser, handle_api
 from .launcher import launch_tui
@@ -21,9 +23,12 @@ def main(argv: list[str] | None = None) -> int:
         return launch_tui(Path.home())
     parser = argparse.ArgumentParser(prog="chatbridge", description="Bridge local AI chat histories between Copilot, Codex, and Claude Code.")
     parser.add_argument("--home", default=str(Path.home()), help="Home directory to read/write histories from. Defaults to current HOME.")
+    parser.add_argument("--version", action="version", version=f"chatbridge {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     tui_cmd = sub.add_parser("tui", help="Open the interactive TUI.")
+    update_cmd = sub.add_parser("update", help="Update a release-installer ChatBridge install.")
+    update_cmd.add_argument("--version", default="latest", help="Release tag to install. Default: latest")
 
     list_cmd = sub.add_parser("list", help="List recovered sessions from one source.")
     list_cmd.add_argument("--source", required=True, choices=sorted(SUPPORTED_SOURCES))
@@ -85,6 +90,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_api(args, home)
         if args.command == "tui":
             return launch_tui(home)
+        if args.command == "update":
+            return update_release_install(args.version)
         if args.command == "list":
             return _list(args, home)
         if args.command == "handoff":

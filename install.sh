@@ -286,8 +286,11 @@ write_wrapper() {
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTHONPATH="$INSTALL_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
-exec "$PYTHON_BIN" -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("chatbridge", run_name="__main__", alter_sys=True)' "$INSTALL_DIR" "\$@"
+export CHATBRIDGE_PREFIX="\${CHATBRIDGE_PREFIX:-$PREFIX}"
+export CHATBRIDGE_INSTALL_DIR="\${CHATBRIDGE_INSTALL_DIR:-$INSTALL_DIR}"
+export CHATBRIDGE_INSTALLER_URL="\${CHATBRIDGE_INSTALLER_URL:-https://github.com/ylexLiao/chatbridge/releases/latest/download/install.sh}"
+export PYTHONPATH="\$CHATBRIDGE_INSTALL_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "$PYTHON_BIN" -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("chatbridge", run_name="__main__", alter_sys=True)' "\$CHATBRIDGE_INSTALL_DIR" "\$@"
 EOF
   chmod +x "$wrapper"
   echo "chatbridge installed: $wrapper"

@@ -254,6 +254,8 @@ try {
   $ps1 = Join-Path $bin "chatbridge.ps1"
   $pythonCommandLiteral = QuotePs $PythonCommand
   $pythonArgsLiteral = (($PythonArgs | ForEach-Object { QuotePs $_ }) -join ", ")
+  $prefixLiteral = QuotePs $Prefix
+  $installDirLiteral = QuotePs $InstallDir
   @(
     "`$bootstrap = @'",
     "import runpy",
@@ -261,10 +263,13 @@ try {
     "sys.path.insert(0, sys.argv.pop(1))",
     "runpy.run_module(`"chatbridge`", run_name=`"__main__`", alter_sys=True)",
     "'@",
-    "`$env:PYTHONPATH = $(QuotePs $InstallDir) + [System.IO.Path]::PathSeparator + `$env:PYTHONPATH",
+    "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_PREFIX)) { `$env:CHATBRIDGE_PREFIX = $prefixLiteral }",
+    "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_INSTALL_DIR)) { `$env:CHATBRIDGE_INSTALL_DIR = $installDirLiteral }",
+    "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_INSTALLER_URL)) { `$env:CHATBRIDGE_INSTALLER_URL = 'https://github.com/ylexLiao/chatbridge/releases/latest/download/install.ps1' }",
+    "`$env:PYTHONPATH = `$env:CHATBRIDGE_INSTALL_DIR + [System.IO.Path]::PathSeparator + `$env:PYTHONPATH",
     "`$pythonCommand = $pythonCommandLiteral",
     "`$pythonArgs = @($pythonArgsLiteral)",
-    "& `$pythonCommand @pythonArgs -c `$bootstrap $(QuotePs $InstallDir) @args",
+    "& `$pythonCommand @pythonArgs -c `$bootstrap `$env:CHATBRIDGE_INSTALL_DIR @args",
     "exit `$LASTEXITCODE"
   ) | Set-Content -Encoding UTF8 $ps1
 

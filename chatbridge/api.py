@@ -9,7 +9,7 @@ from typing import Any
 
 from .models import Session
 from .parsers import SUPPORTED_SOURCES, count_sessions, find_session, load_sessions
-from .paths import path_doctor
+from .paths import path_doctor, set_path_overrides
 from .summary import build_handoff
 from .writers import native_import
 
@@ -47,6 +47,10 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     paths_cmd = api_sub.add_parser("paths", help="Inspect configured history paths as JSON.")
     paths_sub = paths_cmd.add_subparsers(dest="paths_command", required=True)
     paths_sub.add_parser("doctor")
+    paths_set = paths_sub.add_parser("set")
+    paths_set.add_argument("--copilot-workspace-storage")
+    paths_set.add_argument("--codex-home")
+    paths_set.add_argument("--claude-home")
 
 
 def handle_api(args: argparse.Namespace, home: Path) -> int:
@@ -87,6 +91,16 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
             return _write_ok({"text": text})
         if args.api_command == "paths" and args.paths_command == "doctor":
             return _write_ok({"text": path_doctor(home)})
+        if args.api_command == "paths" and args.paths_command == "set":
+            if not (args.copilot_workspace_storage or args.codex_home or args.claude_home):
+                raise SystemExit("Provide at least one path override.")
+            config_path = set_path_overrides(
+                home,
+                copilot_workspace_storage=args.copilot_workspace_storage,
+                codex_home=args.codex_home,
+                claude_home=args.claude_home,
+            )
+            return _write_ok({"text": f"Wrote ChatBridge path config: {config_path}\n\n{path_doctor(home)}"})
     except SystemExit as exc:
         return _write_error(str(exc), _error_kind(str(exc)))
     except Exception as exc:

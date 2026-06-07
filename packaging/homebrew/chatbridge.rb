@@ -3,7 +3,7 @@
 class Chatbridge < Formula
   desc "Local TUI/CLI bridge for Copilot, Codex, and Claude Code chat histories"
   homepage "https://github.com/ylexLiao/chatbridge"
-  url "https://github.com/ylexLiao/chatbridge/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/ylexLiao/chatbridge/archive/refs/tags/v1.0.1.tar.gz"
   sha256 "REPLACE_WITH_RELEASE_SHA256"
   license "MIT"
   head "https://github.com/ylexLiao/chatbridge.git", branch: "main"

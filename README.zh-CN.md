@@ -54,6 +54,13 @@ chatbridge
 Release 安装脚本会下载对应平台的预编译 Rust TUI。普通用户不需要 Rust/Cargo。
 在 macOS 和 Linux 上，安装脚本会优先把 `chatbridge` 启动器放到当前 `PATH` 中可写的 bin 目录；如果找不到，才回退到 `~/.local/bin` 并打印需要添加的 `PATH` 配置。Windows 安装脚本会在需要时更新当前 PowerShell 会话的 `PATH`，让下一行 `chatbridge` 可以直接运行。
 
+升级已有的 release 安装：
+
+```bash
+chatbridge update
+chatbridge --version
+```
+
 当前预编译 release 覆盖 macOS arm64/x64、Linux arm64/x64、Windows x64。Linux release 二进制使用 musl 构建，避免要求目标机器安装较新的 glibc。其他平台可以走源码构建。
 
 | 平台 | 预编译包 | 要求 |
@@ -94,7 +101,7 @@ npm run build:tui
 
 ### Homebrew
 
-Homebrew 支持会在第一次 release checksum 可用后补上。当前模板在 [packaging/homebrew/chatbridge.rb](packaging/homebrew/chatbridge.rb)。
+Homebrew tap 发布后会补上。当前仓库只有 formula 模板：[packaging/homebrew/chatbridge.rb](packaging/homebrew/chatbridge.rb)，还没有发布 `brew install chatbridge` / `brew upgrade chatbridge` 这条安装通道。
 
 ## 卸载
 
@@ -162,6 +169,8 @@ chatbridge native-import --from claude --to copilot --session <session-id> --pro
 | Claude Code | 支持 | 支持 | `~/.claude/history.jsonl`、project transcript JSONL |
 
 ## 路径配置
+
+在 TUI 里按 `P` 可以打开路径设置表单。选择要设置的目标路径，输入目录后按 `Enter` 保存。
 
 ```bash
 chatbridge paths doctor

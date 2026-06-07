@@ -1672,11 +1672,73 @@ class ChatbridgeTests(unittest.TestCase):
         self.assertIn("sys.path.insert(0, sys.argv.pop(1))", shell_installer)
         self.assertIn("runpy.run_module", shell_installer)
         self.assertIn("--uninstall", shell_installer)
+        self.assertIn("CHATBRIDGE_PREFIX", shell_installer)
+        self.assertIn("CHATBRIDGE_INSTALL_DIR", shell_installer)
+        self.assertIn("CHATBRIDGE_INSTALLER_URL", shell_installer)
         self.assertNotIn("-m chatbridge \"\\$@\"", shell_installer)
         self.assertIn("sys.path.insert(0, sys.argv.pop(1))", powershell_installer)
         self.assertIn("runpy.run_module", powershell_installer)
         self.assertIn("[switch]$Uninstall", powershell_installer)
+        self.assertIn("CHATBRIDGE_PREFIX", powershell_installer)
+        self.assertIn("CHATBRIDGE_INSTALL_DIR", powershell_installer)
+        self.assertIn("CHATBRIDGE_INSTALLER_URL", powershell_installer)
         self.assertNotIn("-m chatbridge @args", powershell_installer)
+
+    def test_version_flag_reports_current_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = make_home(Path(temp_dir))
+
+            result = run_cli(home, "--version")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("chatbridge 1.0.1", result.stdout)
+
+    def test_update_requires_release_installer_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = make_home(Path(temp_dir))
+
+            result = run_cli(home, "update")
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("release-installer installs", result.stderr)
+
+    def test_update_runs_installer_with_recorded_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = make_home(temp)
+            prefix = temp / "prefix"
+            install_dir = temp / "install"
+            marker = temp / "update-marker.txt"
+            installer = temp / "install.sh"
+            installer.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -euo pipefail",
+                        "printf 'prefix=%s\\ninstall_dir=%s\\nargs=%s\\n' \"$CHATBRIDGE_PREFIX\" \"$CHATBRIDGE_INSTALL_DIR\" \"$*\" > \"$CHATBRIDGE_UPDATE_MARKER\"",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cli(
+                home,
+                "update",
+                extra_env={
+                    "CHATBRIDGE_PREFIX": str(prefix),
+                    "CHATBRIDGE_INSTALL_DIR": str(install_dir),
+                    "CHATBRIDGE_INSTALLER_URL": installer.as_uri(),
+                    "CHATBRIDGE_UPDATE_MARKER": str(marker),
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("chatbridge update: installing latest", result.stdout)
+            marker_text = marker.read_text(encoding="utf-8")
+            self.assertIn(f"prefix={prefix}", marker_text)
+            self.assertIn(f"install_dir={install_dir}", marker_text)
+            self.assertIn(f"--prefix {prefix} --dir {install_dir} --version latest", marker_text)
 
     def test_no_args_opens_rust_tui_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1876,6 +1938,20 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             config = json.loads((home / ".chatbridge/config.json").read_text(encoding="utf-8"))
             self.assertEqual(config["paths"]["codex_home"], str(custom))
+
+    def test_api_path_set_writes_config_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = make_home(Path(temp_dir))
+            custom = home / "custom-claude"
+
+            result = run_cli(home, "api", "paths", "set", "--claude-home", str(custom))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertIn("Wrote ChatBridge path config", payload["data"]["text"])
+            config = json.loads((home / ".chatbridge/config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["paths"]["claude_home"], str(custom))
 
     def test_path_edit_creates_config_template_and_uses_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

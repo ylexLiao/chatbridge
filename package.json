@@ -1,6 +1,6 @@
 {
   "name": "chatbridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Local TUI/CLI bridge for Copilot, Codex, and Claude Code chat histories",
   "license": "MIT",
   "type": "commonjs",
