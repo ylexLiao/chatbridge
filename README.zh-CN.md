@@ -239,6 +239,10 @@ npm run build:tui
 npm pack --dry-run
 ```
 
+##致谢
+
+感谢LINUXDO提供的帮助：https://linux.do
+
 ## 许可证
 
 MIT
