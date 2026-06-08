@@ -239,6 +239,9 @@ npm run build:tui
 npm pack --dry-run
 ```
 
+## Acknowledgments
+Thanks for the help from LINUXDO: https://linux.do
+
 ## License
 
 MIT
