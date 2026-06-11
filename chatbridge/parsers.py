@@ -9,10 +9,12 @@ from typing import Any
 
 from .models import Artifact, Message, Session
 from .paths import resolve_paths
-from .util import file_uri_to_path, iter_jsonl, project_to_claude_slug, read_json, text_from_any
+from .util import file_uri_to_path, iter_jsonl, project_to_claude_slug, read_json, text_from_any, timestamp_sort_key
 
 
 SUPPORTED_SOURCES = {"copilot", "codex", "claude"}
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def load_sessions(source: str, home: Path, metadata_only: bool = False, limit: int | None = None) -> list[Session]:
@@ -38,7 +40,7 @@ def count_sessions(source: str, home: Path, project: str | None = None) -> int:
 def find_session(source: str, home: Path, session_id: str | None = None, project: str | None = None) -> Session:
     if source == "copilot" and session_id:
         direct = load_copilot_session(home, session_id)
-        if direct:
+        if direct and _session_matches_project(direct, project):
             return direct
     if source == "codex" and session_id:
         direct = load_codex_session(home, session_id)
@@ -58,7 +60,11 @@ def find_session(source: str, home: Path, session_id: str | None = None, project
         raise SystemExit(_missing_session_message(source, home, session_id))
     if not sessions:
         raise SystemExit(f"No {source} sessions found")
-    return sorted(sessions, key=lambda s: str(s.updated_at or s.created_at or ""), reverse=True)[0]
+    return sorted(
+        sessions,
+        key=lambda s: timestamp_sort_key(s.updated_at if s.updated_at not in (None, "") else s.created_at),
+        reverse=True,
+    )[0]
 
 
 def _session_matches_project(session: Session, project: str | None) -> bool:
@@ -108,12 +114,6 @@ def load_copilot_session(home: Path, session_id: str) -> Session | None:
         transcript = ws / "GitHub.copilot-chat" / "transcripts" / f"{session_id}.jsonl"
         if transcript.exists():
             session = Session(source="copilot", session_id=session_id, title=session_id, project_path=project_path, metadata={"workspace_hash": ws.name}, raw_path=transcript)
-            for row in iter_jsonl(transcript):
-                if isinstance(row, dict):
-                    role = str(row.get("role") or row.get("type") or "assistant")
-                    text = text_from_any(row.get("content") or row.get("message") or row.get("text"))
-                    if text:
-                        session.messages.append(Message(role=role, text=text, timestamp=row.get("timestamp")))
             _attach_copilot_extras(ws, session)
             return session
     return None
@@ -122,17 +122,24 @@ def load_copilot_session(home: Path, session_id: str) -> Session | None:
 def _attach_copilot_extras(ws: Path, session: Session) -> None:
     transcript = ws / "GitHub.copilot-chat" / "transcripts" / f"{session.session_id}.jsonl"
     if transcript.exists():
-        for row in iter_jsonl(transcript):
-            if isinstance(row, dict):
-                role = str(row.get("role") or row.get("type") or "assistant")
-                text = text_from_any(row.get("content") or row.get("message") or row.get("text"))
-                if text:
-                    session.messages.append(Message(role=role, text=text, timestamp=row.get("timestamp")))
+        _append_copilot_transcript(session, transcript)
     resources = ws / "GitHub.copilot-chat" / "chat-session-resources" / session.session_id
     if resources.exists():
         for content in sorted(resources.rglob("content.txt")):
             text = content.read_text(encoding="utf-8", errors="replace")
             session.artifacts.append(Artifact(kind="resource", text=text, path=str(content)))
+
+
+def _append_copilot_transcript(session: Session, transcript: Path) -> None:
+    seen = {(message.role, message.text) for message in session.messages}
+    for row in iter_jsonl(transcript):
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or row.get("type") or "assistant")
+        text = text_from_any(row.get("content") or row.get("message") or row.get("text"))
+        if text and (role, text) not in seen:
+            seen.add((role, text))
+            session.messages.append(Message(role=role, text=text, timestamp=row.get("timestamp")))
 
 def load_copilot_sessions(home: Path, metadata_only: bool = False, limit: int | None = None) -> list[Session]:
     root = resolve_paths(home).copilot_workspace_storage
@@ -153,7 +160,7 @@ def load_copilot_sessions(home: Path, metadata_only: bool = False, limit: int | 
                         candidates.append((path.stat().st_mtime, ws, path))
                     except OSError:
                         continue
-        for _, ws, path in sorted(candidates, reverse=True)[: max(limit * 3, limit)]:
+        for _, ws, path in sorted(candidates, reverse=True)[: limit * 3]:
             project_path = workspace_paths.setdefault(ws, _read_workspace_path(ws))
             session = _copilot_metadata_fast(path, project_path, ws.name)
             if session:
@@ -186,11 +193,7 @@ def load_copilot_sessions(home: Path, metadata_only: bool = False, limit: int | 
                     metadata={"workspace_hash": ws.name},
                     raw_path=path,
                 )
-                for row in iter_jsonl(path):
-                    role = str(row.get("role") or row.get("type") or "assistant")
-                    text = text_from_any(row.get("content") or row.get("message") or row.get("text"))
-                    if text:
-                        session.messages.append(Message(role=role, text=text, timestamp=row.get("timestamp")))
+                _append_copilot_transcript(session, path)
                 sessions[sid] = session
         resources_root = ws / "GitHub.copilot-chat" / "chat-session-resources"
         if resources_root.exists() and not metadata_only:
@@ -254,7 +257,7 @@ def count_codex_sessions(home: Path, project: str | None = None) -> int:
     for path in sessions_root.rglob("*.jsonl"):
         ids.add(_codex_id_from_path(path, index))
     if project:
-        return len([session for session in load_codex_sessions(home, metadata_only=False) if session.project_path == project])
+        return len([session for session in load_codex_sessions(home, metadata_only=True) if session.project_path == project])
     return len(ids)
 
 
@@ -276,7 +279,7 @@ def count_claude_sessions(home: Path, project: str | None = None) -> int:
     projects = root / "projects"
     if projects.exists():
         for path in projects.rglob("*.jsonl"):
-            if "/subagents/" not in str(path):
+            if "subagents" not in path.parts:
                 history_ids.add(path.stem)
     return len(history_ids)
 
@@ -306,8 +309,14 @@ def _copilot_metadata_fast(path: Path, project_path: str | None, workspace_hash:
 
 
 def _regex_value(text: str, key: str) -> str | None:
-    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', text)
-    return match.group(1) if match else None
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*("(?:[^"\\]|\\.)*")', text)
+    if not match:
+        return None
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _regex_number(text: str, key: str) -> int | None:
@@ -525,11 +534,8 @@ def _copilot_request_artifacts(req: dict[str, Any]) -> list[Artifact]:
 
 
 def _extract_copilot_path(text: str) -> str | None:
-    matches = re.findall(r"(?:file://)?(/[^\s`'\")]+)", text)
-    for match in matches:
-        if match.startswith(("/home/", "/repo/", "/tmp/")):
-            return match
-    return None
+    match = re.search(r"(?:file://)?([A-Za-z]:[\\/][^\s`'\")]+|/[^\s`'\")]+)", text)
+    return match.group(1) if match else None
 
 
 def _join_unique_text(parts: list[str]) -> str:
@@ -568,6 +574,7 @@ def load_codex_sessions(home: Path, metadata_only: bool = False, limit: int | No
         sid = _codex_id_from_path(path, index)
         session = _codex_session_from_rollout(path, sid, index.get(sid, {}), metadata_only=metadata_only)
         sessions[sid] = session
+    seen_texts: dict[str, set[str]] = {}
     for row in iter_jsonl(root / "history.jsonl"):
         if not isinstance(row, dict) or not row.get("session_id"):
             continue
@@ -578,8 +585,13 @@ def load_codex_sessions(home: Path, metadata_only: bool = False, limit: int | No
         )
         if metadata_only:
             continue
+        seen = seen_texts.get(sid)
+        if seen is None:
+            seen = {message.text for message in session.messages}
+            seen_texts[sid] = seen
         text = text_from_any(row.get("text"))
-        if text and not any(m.text == text for m in session.messages):
+        if text and text not in seen:
+            seen.add(text)
             session.messages.append(Message(role="user", text=text, timestamp=row.get("ts")))
     return list(sessions.values())
 
@@ -606,14 +618,17 @@ def load_codex_session(home: Path, session_id: str) -> Session | None:
         updated_at=meta.get("updated_at_ms") or meta.get("updated_at"),
         raw_path=Path(str(meta["rollout_path"])) if meta.get("rollout_path") else None,
     )
+    seen_texts = {message.text for message in session.messages}
     for key in ("first_user_message", "preview"):
         text = text_from_any(meta.get(key))
-        if text and not any(message.text == text for message in session.messages):
+        if text and text not in seen_texts:
+            seen_texts.add(text)
             session.messages.append(Message(role="user", text=text, timestamp=session.updated_at or session.created_at))
     for row in iter_jsonl(root / "history.jsonl"):
         if isinstance(row, dict) and str(row.get("session_id") or "") == session_id:
             text = text_from_any(row.get("text"))
-            if text and not any(message.text == text for message in session.messages):
+            if text and text not in seen_texts:
+                seen_texts.add(text)
                 session.messages.append(Message(role="user", text=text, timestamp=row.get("ts")))
     return session
 
@@ -722,7 +737,7 @@ def _load_codex_metadata_limited(root: Path, index: dict[str, dict[str, Any]], l
         if len(sessions) >= limit:
             return list(sessions.values())
 
-    for sid, meta in sorted(index.items(), key=lambda item: str(item[1].get("updated_at") or ""), reverse=True):
+    for sid, meta in sorted(index.items(), key=lambda item: timestamp_sort_key(item[1].get("updated_at")), reverse=True):
         if sid in sessions:
             continue
         sessions[sid] = Session(
@@ -824,10 +839,12 @@ def _codex_id_from_path(path: Path, index: dict[str, dict[str, Any]]) -> str:
     for sid in index:
         if sid in name:
             return sid
-    if "-" in name:
-        candidate = name.split("-")[-1]
-        if candidate:
-            return candidate
+    match = _UUID_RE.search(name)
+    if match:
+        return match.group(0)
+    stripped = re.sub(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-", "", name)
+    if stripped:
+        return stripped
     return name
 
 
@@ -844,7 +861,7 @@ def load_claude_sessions(home: Path, metadata_only: bool = False, limit: int | N
     projects = root / "projects"
     if projects.exists():
         for path in sorted(projects.rglob("*.jsonl")):
-            if "/subagents/" in str(path):
+            if "subagents" in path.parts:
                 continue
             sid = path.stem
             meta = history.get(sid, {})
@@ -868,13 +885,21 @@ def load_claude_sessions(home: Path, metadata_only: bool = False, limit: int | N
                     if text:
                         session.messages.append(Message(role=str(role), text=text, timestamp=row.get("timestamp")))
             sessions[sid] = session
+    seen_texts: dict[str, set[str]] = {}
     for sid, row in history.items():
         session = sessions.setdefault(
             sid,
             Session(source="claude", session_id=sid, title=str(row.get("display") or sid), project_path=row.get("project"), updated_at=row.get("timestamp")),
         )
         text = text_from_any(row.get("display"))
-        if text and not any(m.text == text for m in session.messages):
+        if not text:
+            continue
+        seen = seen_texts.get(sid)
+        if seen is None:
+            seen = {message.text for message in session.messages}
+            seen_texts[sid] = seen
+        if text not in seen:
+            seen.add(text)
             session.messages.append(Message(role="user", text=text, timestamp=row.get("timestamp")))
     return list(sessions.values())
 
@@ -919,14 +944,14 @@ def _find_claude_project_file(root: Path, session_id: str) -> Path | None:
     if not projects.exists():
         return None
     for path in projects.rglob(f"{session_id}.jsonl"):
-        if "/subagents/" not in str(path):
+        if "subagents" not in path.parts:
             return path
     return None
 
 
 def _load_claude_metadata_limited(root: Path, history: dict[str, dict[str, Any]], limit: int) -> list[Session]:
     sessions: dict[str, Session] = {}
-    for sid, row in sorted(history.items(), key=lambda item: str(item[1].get("timestamp") or ""), reverse=True):
+    for sid, row in sorted(history.items(), key=lambda item: timestamp_sort_key(item[1].get("timestamp")), reverse=True):
         sessions[sid] = Session(
             source="claude",
             session_id=sid,
@@ -941,7 +966,7 @@ def _load_claude_metadata_limited(root: Path, history: dict[str, dict[str, Any]]
     projects = root / "projects"
     if projects.exists():
         for path in projects.rglob("*.jsonl"):
-            if "/subagents/" in str(path):
+            if "subagents" in path.parts:
                 continue
             try:
                 candidates.append((path.stat().st_mtime, path))

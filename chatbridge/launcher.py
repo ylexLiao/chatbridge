@@ -9,7 +9,15 @@ from pathlib import Path
 def launch_tui(home: Path) -> int:
     binary = _find_rust_tui_binary()
     if not binary:
-        print(_rust_tui_missing_message(), file=sys.stderr)
+        configured = os.environ.get("CHATBRIDGE_TUI_BIN")
+        if configured:
+            print(
+                f"chatbridge error: CHATBRIDGE_TUI_BIN is set to {configured!r}, but that file does not exist.\n"
+                "Unset CHATBRIDGE_TUI_BIN or point it at a valid chatbridge-tui binary.",
+                file=sys.stderr,
+            )
+        else:
+            print(_rust_tui_missing_message(), file=sys.stderr)
         return 1
     env = os.environ.copy()
     root = str(Path(__file__).resolve().parents[1])

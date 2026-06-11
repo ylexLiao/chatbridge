@@ -1,15 +1,16 @@
 use std::env;
-use std::io::{self, Stdout};
+use std::io::{self, Read, Stdout};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -32,6 +33,7 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 const TICK_RATE: Duration = Duration::from_millis(120);
 const DEFAULT_SESSION_LIMIT: usize = 50;
 const SESSION_LIMIT_STEP: usize = 50;
+const DEFAULT_API_TIMEOUT_SECS: u64 = 120;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,10 +53,8 @@ impl ColorMode {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        if get("NO_COLOR").is_some() {
-            return Self::Never;
-        }
-
+        // An explicit, recognized CHATBRIDGE_COLOR setting wins over NO_COLOR:
+        // the user asked this app specifically for that mode.
         match get("CHATBRIDGE_COLOR")
             .as_deref()
             .map(str::trim)
@@ -67,6 +67,14 @@ impl ColorMode {
             Some("truecolor" | "24bit" | "rgb") => return Self::Truecolor,
             Some("auto" | "") | None => {}
             Some(_) => {}
+        }
+
+        // Per no-color.org, NO_COLOR disables color only when non-empty.
+        if get("NO_COLOR")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+        {
+            return Self::Never;
         }
 
         let term = get("TERM").unwrap_or_default().to_ascii_lowercase();
@@ -91,8 +99,11 @@ struct Theme {
 
 impl Theme {
     fn current() -> Self {
+        // Detect once per process: env-based color capability does not change
+        // mid-session, and style helpers run for every span of every frame.
+        static MODE: OnceLock<ColorMode> = OnceLock::new();
         Self {
-            mode: ColorMode::detect(),
+            mode: *MODE.get_or_init(ColorMode::detect),
         }
     }
 
@@ -345,14 +356,15 @@ pub enum Target {
     Codex,
     Claude,
     Copilot,
+    Export,
 }
 
 impl Target {
-    fn available_for(source: Source) -> [Target; 2] {
+    fn available_for(source: Source) -> [Target; 3] {
         match source {
-            Source::Copilot => [Target::Codex, Target::Claude],
-            Source::Codex => [Target::Claude, Target::Copilot],
-            Source::Claude => [Target::Codex, Target::Copilot],
+            Source::Copilot => [Target::Codex, Target::Claude, Target::Export],
+            Source::Codex => [Target::Claude, Target::Copilot, Target::Export],
+            Source::Claude => [Target::Codex, Target::Copilot, Target::Export],
         }
     }
 
@@ -361,6 +373,7 @@ impl Target {
             Target::Codex => "codex",
             Target::Claude => "claude",
             Target::Copilot => "copilot",
+            Target::Export => "export",
         }
     }
 
@@ -369,6 +382,7 @@ impl Target {
             Target::Codex => "Codex CLI",
             Target::Claude => "Claude Code",
             Target::Copilot => "GitHub Copilot",
+            Target::Export => "Export bundle (.json)",
         }
     }
 }
@@ -589,6 +603,10 @@ pub enum UiCommand {
         apply: bool,
         allow_duplicate: bool,
     },
+    ExportSession {
+        source: Source,
+        session_id: String,
+    },
     PathsDoctor,
     SetPath {
         target: PathTarget,
@@ -601,6 +619,7 @@ pub enum WorkerResult {
     Sessions(ApiResult<SessionsData>),
     Handoff(ApiResult<String>),
     Native(ApiResult<String>),
+    Export(ApiResult<String>),
     Paths(ApiResult<String>),
     PathSet(ApiResult<String>),
 }
@@ -632,6 +651,7 @@ pub struct App {
     result_text: String,
     result_scroll: u16,
     result_back_view: View,
+    loading_back_view: View,
     duplicate_message: String,
     duplicate_next_title: String,
     language: Language,
@@ -667,6 +687,7 @@ impl App {
             result_text: String::new(),
             result_scroll: 0,
             result_back_view: View::Home,
+            loading_back_view: View::Home,
             duplicate_message: String::new(),
             duplicate_next_title: String::new(),
             language: Language::English,
@@ -785,8 +806,12 @@ fn parse_home_arg() -> PathBuf {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--home" {
-            if let Some(value) = args.next() {
-                return PathBuf::from(value);
+            match args.next() {
+                Some(value) => return PathBuf::from(value),
+                None => {
+                    eprintln!("chatbridge-tui: --home requires a value");
+                    std::process::exit(2);
+                }
             }
         }
     }
@@ -832,13 +857,16 @@ fn run_loop(terminal: &mut CrosstermTerminal, mut app: App) -> Result<()> {
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> UiCommand {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    {
+        return UiCommand::Quit;
+    }
     if app.filtering {
         return handle_filter_key(app, key);
     }
-    if app.view == View::PathSetup {
-        return handle_path_setup_key(app, key);
-    }
-    if matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
+    // The language toggle stays out of text-input views so 't' remains typeable.
+    if app.view != View::PathSetup && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T')) {
         app.language = app.language.toggle();
         return UiCommand::None;
     }
@@ -851,8 +879,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> UiCommand {
         View::ConfirmDuplicate => handle_confirm_duplicate_key(app, key),
         View::PathSetup => handle_path_setup_key(app, key),
         View::Result => handle_result_key(app, key),
-        View::Loading => UiCommand::None,
+        View::Loading => handle_loading_key(app, key),
     }
+}
+
+fn handle_loading_key(app: &mut App, key: KeyEvent) -> UiCommand {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            cancel_loading(app);
+            UiCommand::None
+        }
+        _ => UiCommand::None,
+    }
+}
+
+fn cancel_loading(app: &mut App) {
+    // Drop the receiver so a late worker result is never applied.
+    app.worker_rx = None;
+    let back_view = app.loading_back_view;
+    show_result(
+        app,
+        text(app.language, "Cancelled", "已取消"),
+        text(
+            app.language,
+            "Operation cancelled.\nNote: an in-flight apply may still finish in the background; check the target tool before retrying.",
+            "操作已取消。\n注意：正在执行的写入可能仍会在后台完成；重试前请先检查目标工具。",
+        ),
+        back_view,
+    );
 }
 
 fn show_result(app: &mut App, title: impl Into<String>, text: impl Into<String>, back_view: View) {
@@ -864,7 +918,10 @@ fn show_result(app: &mut App, title: impl Into<String>, text: impl Into<String>,
 }
 
 fn open_path_setup(app: &mut App) {
-    app.action_index = 3;
+    app.action_index = ChatAction::all()
+        .iter()
+        .position(|action| *action == ChatAction::Paths)
+        .unwrap_or(0);
     app.view = View::PathSetup;
     app.path_index = app.path_index.min(PathTarget::all().len() - 1);
     app.path_input.clear();
@@ -886,7 +943,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
             app.action_index = (app.action_index + 1).min(ChatAction::all().len() - 1);
             UiCommand::None
         }
-        KeyCode::Char('l') => {
+        KeyCode::Char('l') | KeyCode::Char('L') => {
             app.action_index = 0;
             UiCommand::LoadSessions {
                 source: app.source(),
@@ -895,7 +952,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
                 preserve_filter: false,
             }
         }
-        KeyCode::Char('h') => {
+        KeyCode::Char('h') | KeyCode::Char('H') => {
             app.action_index = 1;
             UiCommand::LoadSessions {
                 source: app.source(),
@@ -904,7 +961,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
                 preserve_filter: false,
             }
         }
-        KeyCode::Char('n') => {
+        KeyCode::Char('n') | KeyCode::Char('N') => {
             app.action_index = 2;
             UiCommand::LoadSessions {
                 source: app.source(),
@@ -913,7 +970,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) -> UiCommand {
                 preserve_filter: false,
             }
         }
-        KeyCode::Char('p') => {
+        KeyCode::Char('p') | KeyCode::Char('P') => {
             open_path_setup(app);
             UiCommand::None
         }
@@ -996,8 +1053,13 @@ fn handle_sessions_key(app: &mut App, key: KeyEvent) -> UiCommand {
 
 fn handle_session_preview_key(app: &mut App, key: KeyEvent) -> UiCommand {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.view = View::Sessions;
+            UiCommand::None
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            app.target_index = 0;
+            app.view = View::Target;
             UiCommand::None
         }
         KeyCode::Left | KeyCode::Right => {
@@ -1037,6 +1099,12 @@ fn handle_target_key(app: &mut App, key: KeyEvent) -> UiCommand {
             let Some(session) = app.selected_session() else {
                 return UiCommand::None;
             };
+            if app.target() == Target::Export {
+                return UiCommand::ExportSession {
+                    source: app.source(),
+                    session_id: session.session_id.clone(),
+                };
+            }
             if app.pending_action == ChatAction::Handoff {
                 UiCommand::BuildHandoff {
                     source: app.source(),
@@ -1055,9 +1123,21 @@ fn handle_target_key(app: &mut App, key: KeyEvent) -> UiCommand {
 
 fn handle_confirm_native_key(app: &mut App, key: KeyEvent) -> UiCommand {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
             app.view = View::Target;
             UiCommand::None
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(session) = app.selected_session() else {
+                return UiCommand::None;
+            };
+            UiCommand::NativeImport {
+                source: app.source(),
+                target: app.target(),
+                session_id: session.session_id.clone(),
+                apply: true,
+                allow_duplicate: false,
+            }
         }
         KeyCode::Left => {
             app.confirm_index = app.confirm_index.saturating_sub(1);
@@ -1089,7 +1169,7 @@ fn handle_confirm_native_key(app: &mut App, key: KeyEvent) -> UiCommand {
 
 fn handle_confirm_duplicate_key(app: &mut App, key: KeyEvent) -> UiCommand {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
             show_result(
                 app,
                 "Duplicate Cancelled",
@@ -1097,6 +1177,18 @@ fn handle_confirm_duplicate_key(app: &mut App, key: KeyEvent) -> UiCommand {
                 View::Sessions,
             );
             UiCommand::None
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            let Some(session) = app.selected_session() else {
+                return UiCommand::None;
+            };
+            UiCommand::NativeImport {
+                source: app.source(),
+                target: app.target(),
+                session_id: session.session_id.clone(),
+                apply: true,
+                allow_duplicate: true,
+            }
         }
         KeyCode::Left | KeyCode::Right => {
             app.confirm_index = 1 - app.confirm_index.min(1);
@@ -1138,7 +1230,8 @@ fn handle_result_key(app: &mut App, key: KeyEvent) -> UiCommand {
             UiCommand::None
         }
         KeyCode::Down => {
-            app.result_scroll = app.result_scroll.saturating_add(1);
+            let max_scroll = app.result_text.lines().count().saturating_sub(1) as u16;
+            app.result_scroll = app.result_scroll.saturating_add(1).min(max_scroll);
             UiCommand::None
         }
         _ => UiCommand::None,
@@ -1162,6 +1255,12 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) -> UiCommand {
             UiCommand::None
         }
         KeyCode::Char(value) => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return UiCommand::None;
+            }
             app.filter_input.push(value);
             UiCommand::None
         }
@@ -1183,7 +1282,11 @@ fn handle_path_setup_key(app: &mut App, key: KeyEvent) -> UiCommand {
             app.path_index = (app.path_index + 1).min(PathTarget::all().len() - 1);
             UiCommand::None
         }
-        KeyCode::Char('?') => UiCommand::PathsDoctor,
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            UiCommand::PathsDoctor
+        }
         KeyCode::Enter => {
             let value = app.path_input.trim().to_string();
             if value.is_empty() {
@@ -1205,6 +1308,12 @@ fn handle_path_setup_key(app: &mut App, key: KeyEvent) -> UiCommand {
             UiCommand::None
         }
         KeyCode::Char(value) => {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                return UiCommand::None;
+            }
             app.path_input.push(value);
             UiCommand::None
         }
@@ -1252,6 +1361,12 @@ pub fn begin_command(app: &mut App, command: UiCommand) {
                 let _ = tx.send(WorkerResult::Native(result));
             });
         }
+        UiCommand::ExportSession { source, session_id } => {
+            thread::spawn(move || {
+                let result = api_export(&home, source, &session_id);
+                let _ = tx.send(WorkerResult::Export(result));
+            });
+        }
         UiCommand::PathsDoctor => {
             thread::spawn(move || {
                 let result = api_paths(&home);
@@ -1271,6 +1386,9 @@ pub fn begin_command(app: &mut App, command: UiCommand) {
 }
 
 pub fn prepare_loading(app: &mut App, command: &UiCommand) {
+    if app.view != View::Loading {
+        app.loading_back_view = app.view;
+    }
     match command {
         UiCommand::LoadSessions {
             source,
@@ -1298,6 +1416,10 @@ pub fn prepare_loading(app: &mut App, command: &UiCommand) {
             } else {
                 format!("Preparing dry-run for {}...", target.label())
             };
+            app.view = View::Loading;
+        }
+        UiCommand::ExportSession { source, .. } => {
+            app.loading_message = format!("Exporting {} session to a bundle...", source.label());
             app.view = View::Loading;
         }
         UiCommand::PathsDoctor => {
@@ -1355,6 +1477,9 @@ pub fn apply_worker_result(app: &mut App, result: WorkerResult) {
         WorkerResult::Native(Ok(text)) => {
             show_result(app, "Native Import", text, View::Sessions);
         }
+        WorkerResult::Export(Ok(text)) => {
+            show_result(app, "Export", text, View::Sessions);
+        }
         WorkerResult::Paths(Ok(text)) => {
             show_result(app, "Path Doctor", text, View::Home);
         }
@@ -1371,7 +1496,9 @@ pub fn apply_worker_result(app: &mut App, result: WorkerResult) {
         WorkerResult::Sessions(Err(error)) => {
             show_result(app, "Error", error.message, View::Home);
         }
-        WorkerResult::Handoff(Err(error)) | WorkerResult::Native(Err(error)) => {
+        WorkerResult::Handoff(Err(error))
+        | WorkerResult::Native(Err(error))
+        | WorkerResult::Export(Err(error)) => {
             show_result(app, "Error", error.message, View::Sessions);
         }
         WorkerResult::Paths(Err(error)) => {
@@ -1457,9 +1584,33 @@ fn api_paths(home: &PathBuf) -> ApiResult<String> {
     Ok(data.text)
 }
 
+fn api_export(home: &PathBuf, source: Source, session_id: &str) -> ApiResult<String> {
+    let data: TextData = call_api(
+        home,
+        &[
+            "api",
+            "export",
+            "--from",
+            source.key(),
+            "--session",
+            session_id,
+        ],
+    )?;
+    Ok(data.text)
+}
+
 fn api_set_path(home: &PathBuf, target: PathTarget, value: &str) -> ApiResult<String> {
     let data: TextData = call_api(home, &["api", "paths", "set", target.api_arg(), value])?;
     Ok(data.text)
+}
+
+fn api_timeout() -> Duration {
+    let secs = env::var("CHATBRIDGE_API_TIMEOUT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_API_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 fn call_api<T: DeserializeOwned>(home: &PathBuf, args: &[&str]) -> ApiResult<T> {
@@ -1472,31 +1623,75 @@ fn call_api<T: DeserializeOwned>(home: &PathBuf, args: &[&str]) -> ApiResult<T> 
                 "python3".to_string()
             }
         });
-    let output = Command::new(python)
+    let mut child = Command::new(python)
         .arg("-m")
         .arg("chatbridge")
         .arg("--home")
         .arg(home)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| ApiError {
             kind: "error".to_string(),
             message: format!("Failed to start Python bridge: {error}"),
             next_title: None,
         })?;
-    if !output.status.success() {
+
+    // Drain the pipes on helper threads so a chatty child can never deadlock us.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_handle = thread::spawn(move || read_pipe(stdout_pipe));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr_pipe));
+
+    let timeout = api_timeout();
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return Err(ApiError {
+                        kind: "timeout".to_string(),
+                        message: format!(
+                            "Python bridge timed out after {}s and was terminated. Set CHATBRIDGE_API_TIMEOUT to raise the limit.",
+                            timeout.as_secs()
+                        ),
+                        next_title: None,
+                    });
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                return Err(ApiError {
+                    kind: "error".to_string(),
+                    message: format!("Failed to wait for Python bridge: {error}"),
+                    next_title: None,
+                });
+            }
+        }
+    };
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
+
+    if !status.success() {
         return Err(ApiError {
             kind: "error".to_string(),
-            message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            message: String::from_utf8_lossy(&stderr).trim().to_string(),
             next_title: None,
         });
     }
-    let envelope: ApiEnvelope<T> =
-        serde_json::from_slice(&output.stdout).map_err(|error| ApiError {
-            kind: "error".to_string(),
-            message: format!("Invalid JSON from Python bridge: {error}"),
-            next_title: None,
-        })?;
+    let envelope: ApiEnvelope<T> = serde_json::from_slice(&stdout).map_err(|error| ApiError {
+        kind: "error".to_string(),
+        message: format!("Invalid JSON from Python bridge: {error}"),
+        next_title: None,
+    })?;
     if envelope.ok {
         envelope.data.ok_or_else(|| ApiError {
             kind: "error".to_string(),
@@ -1512,6 +1707,14 @@ fn call_api<T: DeserializeOwned>(home: &PathBuf, args: &[&str]) -> ApiResult<T> 
             next_title: envelope.next_title,
         })
     }
+}
+
+fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    if let Some(mut reader) = pipe {
+        let _ = reader.read_to_end(&mut buffer);
+    }
+    buffer
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -1648,7 +1851,16 @@ fn render_right(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         View::ConfirmNative => render_confirm_native(frame, app, area),
         View::PathSetup => render_path_setup(frame, app, area),
         View::Result => render_result(frame, app, area),
-        View::Loading | View::ConfirmDuplicate => render_home(frame, app, area),
+        // Modals draw over the view the user came from, not always Home.
+        View::ConfirmDuplicate => render_sessions(frame, app, area),
+        View::Loading => match app.loading_back_view {
+            View::Sessions
+            | View::SessionPreview
+            | View::Target
+            | View::ConfirmNative
+            | View::ConfirmDuplicate => render_sessions(frame, app, area),
+            _ => render_home(frame, app, area),
+        },
     }
 }
 
@@ -1787,6 +1999,22 @@ fn render_target(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(content_block(" Target ", lines), area);
 }
 
+fn button_row(options: &[&str], selected: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, label) in options.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if index == selected {
+            selected_style()
+        } else {
+            inactive_chip_style()
+        };
+        spans.push(Span::styled(format!("[ {label} ]"), style));
+    }
+    Line::from(spans)
+}
+
 fn render_confirm_native(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let selected = app
         .selected_session()
@@ -1800,6 +2028,10 @@ fn render_confirm_native(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .selected_session()
         .map(|session| session.updated_time_label())
         .unwrap_or_else(|| "-".to_string());
+    let project = app
+        .selected_session()
+        .map(|session| session.project_label())
+        .unwrap_or_else(|| "-".to_string());
     let options = ["Dry run", "Apply", "Cancel"];
     let lines = vec![
         Line::from(Span::styled("Native Import", accent_style())),
@@ -1808,20 +2040,21 @@ fn render_confirm_native(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(format!("Started: {started}")),
         Line::from(format!("Updated: {updated}")),
         Line::from(format!("Target: {}", app.target().label())),
+        Line::from(vec![
+            Span::raw("Import into project: "),
+            Span::styled(project, secondary_style()),
+        ]),
         Line::from(""),
-        Line::from(
-            options
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    if index == app.confirm_index {
-                        Span::styled(format!(" {label} "), selected_style())
-                    } else {
-                        Span::styled(format!(" {label} "), inactive_chip_style())
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
+        button_row(&options, app.confirm_index),
+        Line::from(""),
+        Line::from(Span::styled(
+            text(
+                app.language,
+                "Enter confirm  Y apply now  N/Esc cancel",
+                "Enter 确认  Y 直接执行  N/Esc 取消",
+            ),
+            subtle_style(),
+        )),
     ];
     frame.render_widget(content_block(" Confirm ", lines), area);
 }
@@ -1944,19 +2177,16 @@ fn render_session_preview(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::raw(session.session_id.clone()),
         ]),
         Line::from(""),
-        Line::from(
-            options
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    if index == app.preview_confirm_index {
-                        Span::styled(format!(" {label} "), selected_style())
-                    } else {
-                        Span::styled(format!(" {label} "), inactive_chip_style())
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
+        button_row(&options, app.preview_confirm_index),
+        Line::from(""),
+        Line::from(Span::styled(
+            text(
+                app.language,
+                "Enter confirm  Y continue  N/Esc cancel",
+                "Enter 确认  Y 继续  N/Esc 取消",
+            ),
+            subtle_style(),
+        )),
     ];
     frame.render_widget(
         content_block(text(app.language, " Chat Preview ", " 会话预览 "), lines),
@@ -1988,8 +2218,8 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         View::SessionPreview => text(
             app.language,
-            "NAV  Left/Right choice  Enter continue/cancel  T language  Esc back",
-            "导航  左/右 选择  Enter 继续/取消  T 语言  Esc 返回",
+            "NAV  Left/Right choice  Enter confirm  Y continue  N/Esc cancel  T language",
+            "导航  左/右 选择  Enter 确认  Y 继续  N/Esc 取消  T 语言",
         ),
         View::Target => text(
             app.language,
@@ -1998,25 +2228,29 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         View::ConfirmNative => text(
             app.language,
-            "NAV  Left/Right choice  Enter confirm  T language  Esc back",
-            "导航  左/右 选择  Enter 确认  T 语言  Esc 返回",
+            "NAV  Left/Right choice  Enter confirm  Y apply  N/Esc cancel  T language",
+            "导航  左/右 选择  Enter 确认  Y 执行  N/Esc 取消  T 语言",
         ),
         View::ConfirmDuplicate => text(
             app.language,
-            "NAV  Left/Right choice  Enter confirm  T language  Esc cancel",
-            "导航  左/右 选择  Enter 确认  T 语言  Esc 取消",
+            "NAV  Left/Right choice  Enter confirm  Y import  N/Esc cancel  T language",
+            "导航  左/右 选择  Enter 确认  Y 导入  N/Esc 取消  T 语言",
         ),
         View::PathSetup => text(
             app.language,
-            "NAV  Up/Down target  Type path  Enter save  ? doctor  Esc back",
-            "导航  上/下 目标  输入路径  Enter 保存  ? 诊断  Esc 返回",
+            "NAV  Up/Down target  Type path  Enter save  Ctrl+D doctor  Esc back",
+            "导航  上/下 目标  输入路径  Enter 保存  Ctrl+D 诊断  Esc 返回",
         ),
         View::Result => text(
             app.language,
             "NAV  Up/Down scroll  Esc/q back  T language",
             "导航  上/下 滚动  Esc/q 返回  T 语言",
         ),
-        View::Loading => text(app.language, "Loading...", "加载中..."),
+        View::Loading => text(
+            app.language,
+            "Loading...  Esc cancel  Ctrl+C quit",
+            "加载中...  Esc 取消  Ctrl+C 退出",
+        ),
     };
     let footer = format!("{footer}    LANG {}    v{VERSION}", app.language.label());
     frame.render_widget(
@@ -2056,7 +2290,7 @@ fn render_duplicate_confirm(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .selected_session()
         .map(|session| session.title.clone())
         .unwrap_or_else(|| "-".to_string());
-    let text = vec![
+    let text_lines = vec![
         Line::from(Span::styled("Duplicate native import", accent_style())),
         Line::from(""),
         Line::from(format!("Session: {session_title}")),
@@ -2064,21 +2298,18 @@ fn render_duplicate_confirm(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Line::from(""),
         Line::from(format!("Next title: {}", app.duplicate_next_title)),
         Line::from(""),
-        Line::from(
-            options
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    if index == app.confirm_index {
-                        Span::styled(format!(" {label} "), selected_style())
-                    } else {
-                        Span::styled(format!(" {label} "), inactive_chip_style())
-                    }
-                })
-                .collect::<Vec<_>>(),
-        ),
+        button_row(&options, app.confirm_index),
+        Line::from(""),
+        Line::from(Span::styled(
+            text(
+                app.language,
+                "Enter confirm  Y import  N/Esc cancel",
+                "Enter 确认  Y 导入  N/Esc 取消",
+            ),
+            subtle_style(),
+        )),
     ];
-    frame.render_widget(content_block(" Confirm Duplicate ", text), area);
+    frame.render_widget(content_block(" Confirm Duplicate ", text_lines), area);
 }
 
 fn render_filter(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2098,7 +2329,9 @@ fn chat_bridge_logo_lines(width: u16) -> Vec<Line<'static>> {
     if width < 20 {
         return vec![Line::from(Span::styled("  CHAT BRIDGE", logo_style()))];
     }
-    if width < 56 {
+    // The full pixel word renders 54 columns wide; keep a safety margin over
+    // the bordered panel's inner width so it never wraps at the breakpoint.
+    if width < 58 {
         let mut lines = pixel_logo_word("CB");
         lines.push(Line::from(Span::styled("  CHAT BRIDGE", logo_style())));
         return lines;
@@ -2109,7 +2342,11 @@ fn chat_bridge_logo_lines(width: u16) -> Vec<Line<'static>> {
 
 fn pixel_logo_word(word: &str) -> Vec<Line<'static>> {
     let rows = logo_word_rows(word);
-    let max_width = rows.iter().map(String::len).max().unwrap_or(0);
+    let max_width = rows
+        .iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut lines = Vec::with_capacity(rows.len() + 1);
     for row_index in 0..=rows.len() {
         let mut spans = vec![Span::raw("  ")];
@@ -2248,7 +2485,8 @@ fn active_panel(title: impl Into<String>) -> Block<'static> {
 
 fn panel_with_border(title: impl Into<String>, border: Style) -> Block<'static> {
     let title = title.into();
-    let title_style = if title.trim().eq_ignore_ascii_case("error") {
+    let normalized = title.trim().to_ascii_lowercase();
+    let title_style = if normalized.contains("error") || normalized.contains("cancelled") {
         danger_style()
     } else {
         accent_style()
@@ -2338,6 +2576,18 @@ fn loading_progress_bar(tick: usize, width: usize) -> String {
 fn compact_title(value: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(value) <= max_width {
         return value.to_string();
+    }
+    if max_width <= 3 {
+        // Too narrow for an ellipsis: hard-cut without ever exceeding the budget.
+        let mut out = String::new();
+        for ch in value.chars() {
+            let ch_width = UnicodeWidthStr::width(ch.to_string().as_str());
+            if UnicodeWidthStr::width(out.as_str()) + ch_width > max_width {
+                break;
+            }
+            out.push(ch);
+        }
+        return out;
     }
     let mut out = String::new();
     for ch in value.chars() {
@@ -2444,11 +2694,19 @@ mod tests {
 
     #[test]
     fn color_mode_detection_respects_no_color_and_dumb_terminal() {
+        assert_eq!(detect_color_mode(&[("NO_COLOR", "1")]), ColorMode::Never);
+        assert_eq!(detect_color_mode(&[("TERM", "dumb")]), ColorMode::Never);
+        // Per no-color.org an EMPTY NO_COLOR must be ignored.
+        assert_eq!(detect_color_mode(&[("NO_COLOR", "")]), ColorMode::Ansi16);
+        // An explicit app-specific opt-in beats the generic NO_COLOR.
         assert_eq!(
             detect_color_mode(&[("NO_COLOR", "1"), ("CHATBRIDGE_COLOR", "truecolor")]),
+            ColorMode::Truecolor
+        );
+        assert_eq!(
+            detect_color_mode(&[("NO_COLOR", "1"), ("CHATBRIDGE_COLOR", "auto")]),
             ColorMode::Never
         );
-        assert_eq!(detect_color_mode(&[("TERM", "dumb")]), ColorMode::Never);
     }
 
     #[test]
@@ -2639,7 +2897,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/tmp/home"));
 
         let buffer = render_buffer(&mut app, 110, 30);
-        assert!(buffer.contains("v1.0.1"));
+        assert!(buffer.contains(&format!("v{VERSION}")));
 
         let _ = handle_key(&mut app, key(KeyCode::Char('t')));
         let buffer = render_buffer(&mut app, 110, 30);
@@ -2660,6 +2918,8 @@ mod tests {
         let _ = handle_key(&mut app, key(KeyCode::Right));
         assert_eq!(app.target(), Target::Claude);
         let _ = handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.target(), Target::Export);
+        let _ = handle_key(&mut app, key(KeyCode::Right));
         assert_eq!(app.target(), Target::Codex);
 
         let command = handle_key(&mut app, key(KeyCode::Enter));
@@ -2676,16 +2936,54 @@ mod tests {
     fn native_targets_cover_all_cross_tool_imports() {
         assert_eq!(
             Target::available_for(Source::Copilot),
-            [Target::Codex, Target::Claude]
+            [Target::Codex, Target::Claude, Target::Export]
         );
         assert_eq!(
             Target::available_for(Source::Codex),
-            [Target::Claude, Target::Copilot]
+            [Target::Claude, Target::Copilot, Target::Export]
         );
         assert_eq!(
             Target::available_for(Source::Claude),
-            [Target::Codex, Target::Copilot]
+            [Target::Codex, Target::Copilot, Target::Export]
         );
+    }
+
+    #[test]
+    fn export_target_enter_emits_export_command() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.view = View::Target;
+        app.pending_action = ChatAction::Native;
+        app.sessions = vec![sample_session()];
+        app.target_index = 2;
+
+        assert_eq!(app.target(), Target::Export);
+        let command = handle_key(&mut app, key(KeyCode::Enter));
+
+        match command {
+            UiCommand::ExportSession { source, session_id } => {
+                assert_eq!(source, Source::Copilot);
+                assert!(session_id.contains("very-long-session-id"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_result_returns_to_sessions() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.sessions = vec![sample_session()];
+
+        apply_worker_result(
+            &mut app,
+            WorkerResult::Export(Ok(
+                "Exported Copilot session s1 to /tmp/bundle.json".to_string()
+            )),
+        );
+
+        assert_eq!(app.view(), &View::Result);
+        assert!(app.result_text.contains("/tmp/bundle.json"));
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Sessions);
     }
 
     #[test]
@@ -2766,13 +3064,149 @@ mod tests {
     }
 
     #[test]
-    fn path_setup_question_mark_runs_doctor() {
+    fn path_setup_question_mark_types_into_input_and_ctrl_d_runs_doctor() {
         let mut app = App::new(PathBuf::from("/tmp/home"));
         open_path_setup(&mut app);
 
         let command = handle_key(&mut app, key(KeyCode::Char('?')));
+        assert!(matches!(command, UiCommand::None));
+        assert_eq!(app.path_input, "?");
 
+        let command = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
         assert!(matches!(command, UiCommand::PathsDoctor));
+    }
+
+    #[test]
+    fn path_setup_t_is_typeable_not_language_toggle() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        open_path_setup(&mut app);
+
+        let _ = handle_key(&mut app, key(KeyCode::Char('t')));
+
+        assert_eq!(app.path_input, "t");
+        assert_eq!(app.language, Language::English);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_any_view() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        for view in [View::Home, View::Sessions, View::Loading, View::PathSetup] {
+            app.view = view;
+            let command = handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            );
+            assert!(matches!(command, UiCommand::Quit), "view {view:?}");
+        }
+    }
+
+    #[test]
+    fn loading_escape_cancels_and_restores_back_view() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.view = View::Sessions;
+        app.sessions = vec![sample_session()];
+        let command = UiCommand::BuildHandoff {
+            source: Source::Copilot,
+            target: Target::Codex,
+            session_id: "s1".to_string(),
+        };
+        prepare_loading(&mut app, &command);
+        assert_eq!(app.view(), &View::Loading);
+        let (tx, rx) = mpsc::channel();
+        app.worker_rx = Some(rx);
+
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(app.view(), &View::Result);
+        assert!(app.result_title.contains("Cancelled"));
+        assert!(app.worker_rx.is_none());
+        // A late worker result must be dropped, not applied.
+        let _ = tx.send(WorkerResult::Handoff(Ok("late".to_string())));
+        drain_worker(&mut app);
+        assert_eq!(app.view(), &View::Result);
+        assert!(!app.result_text.contains("late"));
+        let _ = handle_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Sessions);
+    }
+
+    #[test]
+    fn uppercase_home_hotkeys_match_advertised_chips() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+
+        let command = handle_key(&mut app, key(KeyCode::Char('L')));
+
+        match command {
+            UiCommand::LoadSessions { action, .. } => assert_eq!(action, ChatAction::Recent),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_native_y_applies_and_n_cancels() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.view = View::ConfirmNative;
+        app.pending_action = ChatAction::Native;
+        app.sessions = vec![sample_session()];
+
+        let command = handle_key(&mut app, key(KeyCode::Char('y')));
+        match command {
+            UiCommand::NativeImport { apply, .. } => assert!(apply),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        app.view = View::ConfirmNative;
+        let command = handle_key(&mut app, key(KeyCode::Char('n')));
+        assert!(matches!(command, UiCommand::None));
+        assert_eq!(app.view(), &View::Target);
+    }
+
+    #[test]
+    fn confirm_dialogs_render_button_rows_with_confirm_keys() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.view = View::ConfirmNative;
+        app.pending_action = ChatAction::Native;
+        app.sessions = vec![sample_session()];
+
+        let buffer = render_buffer(&mut app, 120, 32);
+        assert!(buffer.contains("[ Dry run ]"));
+        assert!(buffer.contains("[ Apply ]"));
+        assert!(buffer.contains("[ Cancel ]"));
+        assert!(buffer.contains("Import into project"));
+
+        app.view = View::SessionPreview;
+        let buffer = render_buffer(&mut app, 120, 32);
+        assert!(buffer.contains("[ Continue ]"));
+        assert!(buffer.contains("[ Cancel ]"));
+
+        app.view = View::ConfirmDuplicate;
+        app.duplicate_message = "Duplicate native import detected".to_string();
+        app.duplicate_next_title = "Copy (1)".to_string();
+        let buffer = render_buffer(&mut app, 120, 32);
+        assert!(buffer.contains("[ Import duplicate ]"));
+        assert!(buffer.contains("[ Cancel ]"));
+    }
+
+    #[test]
+    fn compact_title_never_exceeds_tiny_budget() {
+        assert!(UnicodeWidthStr::width(compact_title("全面分析", 2).as_str()) <= 2);
+        assert!(UnicodeWidthStr::width(compact_title("abcdef", 3).as_str()) <= 3);
+        assert!(UnicodeWidthStr::width(compact_title("全面分析方法", 5).as_str()) <= 5);
+    }
+
+    #[test]
+    fn result_scroll_is_clamped_to_content() {
+        let mut app = App::new(PathBuf::from("/tmp/home"));
+        app.view = View::Result;
+        app.result_text = "line1\nline2\nline3".to_string();
+
+        for _ in 0..10 {
+            let _ = handle_key(&mut app, key(KeyCode::Down));
+        }
+
+        assert_eq!(app.result_scroll, 2);
     }
 
     #[test]

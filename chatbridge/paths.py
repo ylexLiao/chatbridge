@@ -106,7 +106,9 @@ def set_path_overrides(
     }
     for key, value in updates.items():
         if value is not None:
-            paths[key] = str(Path(value).expanduser())
+            # Expand like the read path (_expand_path) so '~/x' written here
+            # resolves to the same directory when read back under --home.
+            paths[key] = str(_expand_path(home, value))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path

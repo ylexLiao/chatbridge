@@ -8,6 +8,21 @@ const root = path.resolve(__dirname, "..");
 const python = process.env.PYTHON || process.env.PYTHON3 || (process.platform === "win32" ? "python" : "python3");
 const env = { ...process.env };
 env.PYTHONPATH = root + (env.PYTHONPATH ? path.delimiter + env.PYTHONPATH : "");
+
+const preflight = childProcess.spawnSync(
+  python,
+  ["-c", "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"],
+  { stdio: "ignore" }
+);
+if (preflight.error || preflight.status !== 0) {
+  const reason = preflight.error
+    ? `could not be launched (${preflight.error.message})`
+    : "is older than Python 3.10";
+  console.error(`chatbridge: Python interpreter "${python}" ${reason}.`);
+  console.error("chatbridge: ChatBridge needs Python 3.10+. Set PYTHON (or PYTHON3) to a newer interpreter, e.g. PYTHON=/usr/local/bin/python3.12 chatbridge");
+  process.exit(1);
+}
+
 const bootstrap = [
   "import runpy",
   "import sys",

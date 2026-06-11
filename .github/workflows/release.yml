@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag to publish"
+        description: "Release tag to publish (must equal v<chatbridge.__version__>, e.g. v1.0.2)"
         required: true
-        default: "v1.0.1"
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
@@ -22,8 +21,39 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check tag matches chatbridge.__version__
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("chatbridge/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+          if not match:
+              raise SystemExit("could not find __version__ in chatbridge/__init__.py")
+          print(match.group(1))
+          PY
+          )"
+          expected="v$version"
+          if [ "$RELEASE_TAG" != "$expected" ]; then
+            echo "Release tag '$RELEASE_TAG' does not match the checked-out source version '$expected' (chatbridge/__init__.py)." >&2
+            echo "Bump chatbridge/__init__.py (plus package.json and rust/chatbridge-tui/Cargo.toml) or fix the tag/input." >&2
+            exit 1
+          fi
+          echo "Release tag $RELEASE_TAG matches chatbridge.__version__ $version."
+
   build:
     name: Build ${{ matrix.asset }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,7 +80,9 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
 
       - name: Add Rust target
         if: matrix.rust_target != ''
@@ -134,14 +166,16 @@ jobs:
 
   build-macos:
     name: Build macOS release assets
+    needs: validate
     runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96"
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Build and package macOS assets
@@ -173,19 +207,35 @@ jobs:
           build_asset aarch64-apple-darwin chatbridge-macos-arm64
           build_asset x86_64-apple-darwin chatbridge-macos-x64
 
-      - name: Smoke host-compatible macOS binary
+      - name: Smoke macOS binaries
         shell: bash
         run: |
           set -euo pipefail
+          smoke_asset() {
+            local asset="$1"
+            shift
+            rm -rf "smoke-$asset"
+            mkdir "smoke-$asset"
+            tar -xzf "dist/$asset.tar.gz" -C "smoke-$asset"
+            CHATBRIDGE_TUI_SMOKE=1 "$@" "smoke-$asset/chatbridge/bin/chatbridge-tui"
+          }
           case "$(uname -m)" in
-            arm64) asset=chatbridge-macos-arm64 ;;
-            x86_64) asset=chatbridge-macos-x64 ;;
-            *) echo "Unsupported macOS runner architecture: $(uname -m)" >&2; exit 1 ;;
+            arm64)
+              smoke_asset chatbridge-macos-arm64
+              if arch -x86_64 /usr/bin/true 2>/dev/null; then
+                smoke_asset chatbridge-macos-x64 arch -x86_64
+              else
+                echo "::warning title=Rosetta unavailable::Skipping chatbridge-macos-x64 smoke: this arm64 runner cannot run x86_64 binaries."
+              fi
+              ;;
+            x86_64)
+              smoke_asset chatbridge-macos-x64
+              ;;
+            *)
+              echo "Unsupported macOS runner architecture: $(uname -m)" >&2
+              exit 1
+              ;;
           esac
-          rm -rf smoke
-          mkdir smoke
-          tar -xzf "dist/$asset.tar.gz" -C smoke
-          CHATBRIDGE_TUI_SMOKE=1 smoke/chatbridge/bin/chatbridge-tui
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
@@ -213,18 +263,6 @@ jobs:
         run: |
           cp install.sh install.ps1 dist/
           ls -la dist
-
-      - name: Remove stale release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          for asset in \
-            chatbridge-macos-arm64.tar.gz \
-            chatbridge-macos-x64.tar.gz
-          do
-            gh release delete-asset "$RELEASE_TAG" "$asset" --yes || true
-          done
 
       - name: Create release
         uses: softprops/action-gh-release@v3

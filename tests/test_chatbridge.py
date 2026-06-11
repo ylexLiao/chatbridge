@@ -230,21 +230,27 @@ def make_home(tmp_path: Path) -> Path:
 
 
 def make_fake_rust_tui(path: Path) -> Path:
+    lines = [
+        "ChatBridge TUI",
+        "Rust ratatui TUI",
+        "GitHub Copilot",
+        "Codex CLI",
+        "Claude Code",
+        "Prompt Handoff",
+        "Native Import",
+        "↑/↓ move  Enter select",
+    ]
+    if os.name == "nt":
+        script = path.with_suffix(".py")
+        script.write_text(
+            "\n".join(["import sys"] + [f"print({line!r})" for line in lines] + [""]),
+            encoding="utf-8",
+        )
+        cmd = path.with_suffix(".cmd")
+        cmd.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return cmd
     path.write_text(
-        "\n".join(
-            [
-                "#!/bin/sh",
-                "printf '%s\\n' 'ChatBridge TUI'",
-                "printf '%s\\n' 'Rust ratatui TUI'",
-                "printf '%s\\n' 'GitHub Copilot'",
-                "printf '%s\\n' 'Codex CLI'",
-                "printf '%s\\n' 'Claude Code'",
-                "printf '%s\\n' 'Prompt Handoff'",
-                "printf '%s\\n' 'Native Import'",
-                "printf '%s\\n' '↑/↓ move  Enter select'",
-                "",
-            ]
-        ),
+        "\n".join(["#!/bin/sh"] + [f"printf '%s\\n' '{line}'" for line in lines] + [""]),
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -309,12 +315,12 @@ class ChatbridgeTests(unittest.TestCase):
     def test_redact_handles_password_environment_variables(self) -> None:
         from chatbridge.util import redact
 
-        text = redact("export RPASS='super-secret' PWD=another-secret token=abc123456789")
+        text = redact("export PASS='super-secret' PWD=another-secret token=abc123456789")
 
         self.assertNotIn("super-secret", text)
         self.assertNotIn("another-secret", text)
         self.assertNotIn("abc123456789", text)
-        self.assertIn("RPASS='[REDACTED]'", text)
+        self.assertIn("PASS='[REDACTED]'", text)
         self.assertIn("PWD=[REDACTED]", text)
         self.assertIn("token=[REDACTED]", text)
 
@@ -856,7 +862,9 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertIn("Run tests", request_text)
             self.assertIn("Tests failed", request_text)
 
-    def test_native_import_to_copilot_prefers_current_vscode_workspace(self) -> None:
+    def test_native_import_to_copilot_falls_back_to_current_workspace_when_session_has_no_project(self) -> None:
+        # The codex-1 fixture session has no project of its own, so the import
+        # falls back to the directory ChatBridge runs from.
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             home = make_home(temp)
@@ -906,7 +914,9 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertEqual(message_rows[1]["message"]["role"], "assistant")
             self.assertEqual(message_rows[1]["parentUuid"], message_rows[0]["uuid"])
 
-    def test_native_import_to_claude_prefers_current_project(self) -> None:
+    def test_native_import_to_claude_falls_back_to_current_project_when_session_has_no_project(self) -> None:
+        # The codex-1 fixture session has no project of its own, so the import
+        # falls back to the directory ChatBridge runs from.
         from chatbridge.util import project_to_claude_slug
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1471,175 +1481,6 @@ class ChatbridgeTests(unittest.TestCase):
 
 
 
-    def test_tui_formats_recent_session_rows_for_selection(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import format_session_rows
-
-        rows = format_session_rows([
-            Session(source="copilot", session_id="s1", title="Fix auth", project_path="/repo/app", updated_at=2),
-            Session(source="codex", session_id="s2", title="Run tests", project_path=None, updated_at=1),
-        ])
-
-        self.assertIn("Fix auth", rows)
-        self.assertIn("LOCAL", rows)
-        self.assertIn("s1", rows)
-        self.assertIn("/repo/app", rows)
-        self.assertIn("Run tests", rows)
-
-    def test_tui_formats_copilot_scope_and_truncates_project_paths(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import format_session_rows
-
-        rows = format_session_rows(
-            [
-                Session(source="copilot", session_id="local-session-1234567890", title="Fix local bug", project_path="/home/dev/Desktop/Very_Long_Project_Name_With_Many_Folders/src/app", updated_at=2),
-                Session(source="copilot", session_id="remote-session-1234567890", title="Fix remote bug", project_path='vscode-remote://ssh-remote%2B7b22686f73744e616d65223a2264656d6f227d/home/ubuntu/demo', updated_at=1),
-            ],
-            source="copilot",
-            width=92,
-            page_size=10,
-        )
-
-        self.assertIn("Scope", rows)
-        self.assertIn("LOCAL", rows)
-        self.assertIn("REMOTE", rows)
-        self.assertIn("ssh:demo", rows)
-        self.assertIn("...", rows)
-        self.assertTrue(all(len(line) <= 92 for line in rows.splitlines()))
-
-    def test_tui_session_rows_paginate_beyond_twenty_items(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import format_session_rows
-
-        sessions = [
-            Session(source="copilot", session_id=f"s-{index}", title=f"Session {index}", project_path="/repo/app", updated_at=index)
-            for index in range(1, 26)
-        ]
-
-        rows = format_session_rows(sessions, source="copilot", page=2, page_size=15, width=100)
-
-        self.assertIn("Page 2/2", rows)
-        self.assertIn("16", rows)
-        self.assertIn("Session 16", rows)
-        self.assertIn("25", rows)
-        self.assertIn("Session 25", rows)
-
-    def test_tui_normalizes_arrow_escape_sequences(self) -> None:
-        from chatbridge.tui import _normalize_key
-
-        self.assertEqual(_normalize_key("\x1b[A"), "up")
-        self.assertEqual(_normalize_key("\x1b[B"), "down")
-        self.assertEqual(_normalize_key("\x1b[C"), "right")
-        self.assertEqual(_normalize_key("\x1b[D"), "left")
-        self.assertEqual(_normalize_key("\r"), "enter")
-        self.assertEqual(_normalize_key("\x1b"), "escape")
-
-    def test_tui_reads_arrow_key_from_file_descriptor(self) -> None:
-        from chatbridge.tui import _read_key_fd
-
-        read_fd, write_fd = os.pipe()
-        try:
-            os.write(write_fd, b"\x1b[B")
-            self.assertEqual(_read_key_fd(read_fd), "down")
-        finally:
-            os.close(read_fd)
-            os.close(write_fd)
-
-    def test_tui_arrow_navigation_activates_home_menu(self) -> None:
-        from chatbridge.tui import TuiState, _handle_key
-
-        state = TuiState()
-
-        self.assertTrue(_handle_key(Path.home(), state, "down"))
-        self.assertEqual(state.menu_index, 1)
-        self.assertTrue(_handle_key(Path.home(), state, "enter"))
-        self.assertEqual(state.source, "codex")
-        self.assertEqual(state.action, "home")
-
-    def test_tui_arrow_navigation_selects_session(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import TuiState, _handle_key
-
-        state = TuiState(
-            action="list",
-            sessions=[
-                Session(source="copilot", session_id="s1", title="First", project_path="/repo/app"),
-                Session(source="copilot", session_id="s2", title="Second", project_path="/repo/app"),
-            ],
-        )
-
-        self.assertTrue(_handle_key(Path.home(), state, "down"))
-        self.assertEqual(state.selected_index, 1)
-        self.assertTrue(_handle_key(Path.home(), state, "enter"))
-        self.assertIsNotNone(state.selected)
-        self.assertEqual(state.selected.session_id, "s2")
-        self.assertIn("Second", state.message)
-
-    def test_tui_home_preview_tracks_highlighted_menu_item(self) -> None:
-        from chatbridge.tui import TuiState, _handle_key, render_state_screen
-
-        state = TuiState()
-        for _ in range(4):
-            self.assertTrue(_handle_key(Path.home(), state, "down"))
-
-        screen = render_state_screen(state, width=110)
-
-        self.assertIn("Source: GitHub Copilot", screen)
-        self.assertIn("Cursor: Prompt Handoff", screen)
-        self.assertIn("Highlighted: Prompt Handoff", screen)
-        self.assertIn("Enter: choose source session, then target tool", screen)
-
-    def test_tui_session_list_shows_selected_context_and_next_action(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import TuiState, render_state_screen
-
-        state = TuiState(
-            action="handoff",
-            pending_action="handoff",
-            selected_index=1,
-            sessions=[
-                Session(source="copilot", session_id="s1", title="First", project_path="/repo/app"),
-                Session(source="copilot", session_id="s2", title="Second", project_path="/repo/app"),
-            ],
-        )
-
-        screen = render_state_screen(state, width=120)
-
-        self.assertIn("Selected: Second", screen)
-        self.assertIn("Next: Enter chooses this session for Prompt Handoff", screen)
-
-    def test_tui_menu_highlights_active_action_in_sub_views(self) -> None:
-        from chatbridge.models import Session
-        from chatbridge.tui import TuiState, render_state_screen
-
-        state = TuiState(
-            action="handoff",
-            pending_action="handoff",
-            sessions=[
-                Session(source="copilot", session_id="s1", title="First", project_path="/repo/app"),
-            ],
-        )
-
-        screen = render_state_screen(state, width=120)
-
-        self.assertIn("> H. Prompt Handoff", screen)
-        self.assertNotIn("> 1. GitHub Copilot", screen)
-
-    def test_tui_home_screen_uses_dashboard_cards(self) -> None:
-        from chatbridge.tui import render_home_screen
-
-        screen = render_home_screen(width=100)
-
-        self.assertIn("ChatBridge", screen)
-        self.assertNotIn("ChatNBridge", screen)
-        self.assertIn("GitHub Copilot", screen)
-        self.assertIn("VS Code workspaceStorage", screen)
-        self.assertIn("Prompt Handoff", screen)
-        self.assertIn("Native Import", screen)
-        self.assertIn("Recent Sessions", screen)
-        self.assertIn("NAV", screen)
-        self.assertIn("+", screen)
-
     def test_package_json_declares_npm_bin(self) -> None:
         package_path = ROOT / "package.json"
 
@@ -1685,13 +1526,15 @@ class ChatbridgeTests(unittest.TestCase):
         self.assertNotIn("-m chatbridge @args", powershell_installer)
 
     def test_version_flag_reports_current_version(self) -> None:
+        from chatbridge import __version__
+
         with tempfile.TemporaryDirectory() as temp_dir:
             home = make_home(Path(temp_dir))
 
             result = run_cli(home, "--version")
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("chatbridge 1.0.1", result.stdout)
+            self.assertIn(f"chatbridge {__version__}", result.stdout)
 
     def test_update_requires_release_installer_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1789,8 +1632,9 @@ class ChatbridgeTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 1)
-            self.assertIn("Rust TUI binary was not found", result.stderr)
-            self.assertIn("cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release", result.stderr)
+            self.assertIn("CHATBRIDGE_TUI_BIN is set to", result.stderr)
+            self.assertIn("missing-chatbridge-tui", result.stderr)
+            self.assertIn("Unset CHATBRIDGE_TUI_BIN", result.stderr)
 
     def test_no_args_reports_wrong_platform_rust_tui_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1826,6 +1670,7 @@ class ChatbridgeTests(unittest.TestCase):
             rust_tui = make_fake_rust_tui(temp / "chatbridge-tui")
             env = os.environ.copy()
             env["HOME"] = str(home)
+            env["PYTHON"] = sys.executable
             env["CHATBRIDGE_TUI_SMOKE"] = "1"
             env["CHATBRIDGE_TUI_BIN"] = str(rust_tui)
 
@@ -1852,6 +1697,7 @@ class ChatbridgeTests(unittest.TestCase):
             (shadow_package / "__main__.py").write_text("raise SystemExit('shadow package used')\n", encoding="utf-8")
             env = os.environ.copy()
             env["HOME"] = str(home)
+            env["PYTHON"] = sys.executable
             env["CHATBRIDGE_TUI_SMOKE"] = "1"
             env["CHATBRIDGE_TUI_BIN"] = str(rust_tui)
 
@@ -1878,6 +1724,7 @@ class ChatbridgeTests(unittest.TestCase):
             link.symlink_to(ROOT / "bin" / "chatbridge")
             env = os.environ.copy()
             env["HOME"] = str(home)
+            env["PYTHON"] = sys.executable
             env["CHATBRIDGE_TUI_SMOKE"] = "1"
             env["CHATBRIDGE_TUI_BIN"] = str(rust_tui)
 

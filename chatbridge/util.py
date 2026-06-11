@@ -8,13 +8,20 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
+# Each entry is (compiled_pattern, mode) where mode in {"whole", "keep-key", "private-key"}:
+# - "whole": replace the whole match with [REDACTED]
+# - "keep-key": keep group(1) (the key + separator) and redact the value
+# - "private-key": replace the whole match with [REDACTED_PRIVATE_KEY]
 SECRET_PATTERNS = [
-    re.compile(r"(gh[pousr]_[A-Za-z0-9_]{8,})"),
-    re.compile(r"(sk-[A-Za-z0-9_-]{12,})"),
-    re.compile(r'(?i)((?:token|api[_-]?key|secret|cookie|pwd|[a-z0-9_]*pass(?:word)?)\s*[=:]\s*[\'"]?)([^\s\'"]+)'),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+    (re.compile(r"(gh[pousr]_[A-Za-z0-9_]{8,})"), "whole"),
+    (re.compile(r"(sk-[A-Za-z0-9_-]{12,})"), "whole"),
+    (
+        re.compile(r'(?i)(\b(?:token|api[_-]?key|secret|cookie|passwd|password|pwd|pass)\s*[=:]\s*[\'"]?)([^\s\'"]+)'),
+        "keep-key",
+    ),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S), "private-key"),
 ]
-IMAGE_DATA_URL_RE = re.compile(r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)")
+IMAGE_DATA_URL_RE = re.compile(r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\r\n]+)")
 
 
 def now_stamp() -> str:
@@ -23,6 +30,38 @@ def now_stamp() -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """Parse a source timestamp into a datetime.
+
+    Handles None/"", int/float epoch (milliseconds when > 100000000000),
+    digit strings, and ISO strings with a Z suffix. Naive datetimes are
+    assumed to be in the local timezone.
+    """
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value) / 1000 if float(value) > 100000000000 else float(value)
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    text = str(value).strip()
+    if text.isdigit():
+        return parse_timestamp(int(text))
+    parsed = text.replace("Z", "+00:00") if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(parsed)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.astimezone()
+    return dt
+
+
+def timestamp_sort_key(value: Any) -> float:
+    dt = parse_timestamp(value)
+    if dt is None:
+        return float("-inf")
+    return dt.timestamp()
 
 
 def read_json(path: Path) -> Any | None:
@@ -62,10 +101,10 @@ def write_jsonl(path: Path, rows: Iterable[Any]) -> None:
 
 def redact(text: str) -> str:
     safe = text
-    for pattern in SECRET_PATTERNS:
-        if pattern.flags & re.S:
+    for pattern, mode in SECRET_PATTERNS:
+        if mode == "private-key":
             safe = pattern.sub("[REDACTED_PRIVATE_KEY]", safe)
-        elif pattern.pattern.startswith("(?i)("):
+        elif mode == "keep-key":
             safe = pattern.sub(lambda m: m.group(1) + "[REDACTED]", safe)
         else:
             safe = pattern.sub("[REDACTED]", safe)
@@ -88,8 +127,6 @@ def text_from_any(value: Any) -> str:
                 result = text_from_any(value[key])
                 if result:
                     return result
-        if value.get("type") == "text" and "text" in value:
-            return str(value["text"])
         return " ".join(filter(None, (text_from_any(v) for v in value.values())))
     return str(value)
 
@@ -114,7 +151,7 @@ def _image_placeholder_from_mapping(value: dict[str, Any]) -> str:
 
 
 def _embedded_image_placeholder(mime_type: str, payload: str) -> str:
-    clean_payload = re.sub(r"\s+", "", payload)
+    clean_payload = re.sub(r"[\r\n]+", "", payload)
     byte_count = _base64_decoded_size(clean_payload)
     suffix = f", approx {format_bytes(byte_count)}" if byte_count else ""
     image_type = mime_type.split("/", 1)[1].upper()

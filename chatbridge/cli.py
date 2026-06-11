@@ -5,10 +5,12 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .export import load_bundle, write_bundle
 from .parsers import SUPPORTED_SOURCES, find_session, load_sessions
 from .paths import edit_path_overrides, path_doctor, set_path_overrides
 from .summary import build_handoff
 from .update import update_release_install
+from .util import timestamp_sort_key
 from .writers import native_import, repair_claude_imports, repair_codex_imports, repair_copilot_imports
 from .api import add_api_parser, handle_api
 from .launcher import launch_tui
@@ -43,11 +45,18 @@ def main(argv: list[str] | None = None) -> int:
     handoff_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
     handoff_cmd.add_argument("--last", action="store_true", help="Use the most recent matching session. This is the default when --session is omitted.")
 
+    export_cmd = sub.add_parser("export", help="Export a session to a portable ChatBridge bundle (.json) that any machine can native-import.")
+    export_cmd.add_argument("--from", dest="source", required=True, choices=sorted(SUPPORTED_SOURCES))
+    export_cmd.add_argument("--session")
+    export_cmd.add_argument("--project")
+    export_cmd.add_argument("--out", help="Output file or directory. Default: ./chatbridge-export-<source>-<session>.json")
+
     native_cmd = sub.add_parser("native-import", help="Import a source session summary into a target native history format.")
-    native_cmd.add_argument("--from", dest="source", required=True, choices=sorted(SUPPORTED_SOURCES))
+    native_cmd.add_argument("--from", dest="source", choices=sorted(SUPPORTED_SOURCES), help="Source tool to read the session from. Omit when using --bundle.")
     native_cmd.add_argument("--to", dest="target", required=True, choices=sorted(TARGETS))
     native_cmd.add_argument("--session")
-    native_cmd.add_argument("--project")
+    native_cmd.add_argument("--bundle", help="Import from a ChatBridge export bundle file instead of a local source tool.")
+    native_cmd.add_argument("--project", help="Destination project path for the import. Default: the session's own project path.")
     native_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
     native_cmd.add_argument("--allow-duplicate", action="store_true", help="Import another copy when a matching native import already exists, suffixing the title.")
     native_cmd.add_argument("--force", action="store_true", help="For Copilot imports, write even if VS Code is running and may overwrite the import.")
@@ -98,8 +107,18 @@ def main(argv: list[str] | None = None) -> int:
             session = find_session(args.source, home, args.session, args.project)
             sys.stdout.write(build_handoff(session, args.target, args.level))
             return 0
+        if args.command == "export":
+            session = find_session(args.source, home, args.session, args.project)
+            bundle_path = write_bundle(session, Path(args.out).expanduser() if args.out else None)
+            print(f"Exported {session.source_label} session {session.session_id} to {bundle_path}")
+            return 0
         if args.command == "native-import":
-            session = find_session(args.source, home, args.session, None)
+            if args.bundle:
+                session = load_bundle(Path(args.bundle))
+            elif args.source:
+                session = find_session(args.source, home, args.session, None)
+            else:
+                raise SystemExit("Provide --from SOURCE or --bundle FILE.")
             sys.stdout.write(
                 native_import(
                     session,
@@ -142,9 +161,11 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(f"Wrote ChatBridge path config: {config_path}\n")
                 return 0
     except SystemExit as exc:
-        message = str(exc)
-        if message:
-            print(message, file=sys.stderr)
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        if code:
+            print(code, file=sys.stderr)
         return 2
     except Exception as exc:
         print(f"chatbridge error: {exc}", file=sys.stderr)
@@ -153,11 +174,18 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _list(args: argparse.Namespace, home: Path) -> int:
-    sessions = load_sessions(args.source, home, metadata_only=True, limit=args.limit)
+    limit = max(1, int(args.limit or 1))
+    # With a project filter, load everything first so older projects are not
+    # silently hidden by the recency-limited fast path.
+    sessions = load_sessions(args.source, home, metadata_only=True, limit=None if args.project else limit)
     if args.project:
         sessions = [s for s in sessions if s.project_path == args.project]
-    sessions = sorted(sessions, key=lambda s: str(s.updated_at or s.created_at or ""), reverse=True)
-    for session in sessions[: args.limit]:
+    sessions = sorted(
+        sessions,
+        key=lambda s: timestamp_sort_key(s.updated_at if s.updated_at not in (None, "") else s.created_at),
+        reverse=True,
+    )
+    for session in sessions[:limit]:
         updated = session.updated_at or session.created_at or ""
         project = session.project_path or ""
         print(f"{session.session_id}\t{session.title}\t{updated}\t{project}")

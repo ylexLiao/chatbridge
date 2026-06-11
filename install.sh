@@ -12,8 +12,10 @@ BRANCH="${CHATBRIDGE_BRANCH:-main}"
 FROM_SOURCE=0
 BOOTSTRAP_RUST=0
 UNINSTALL=0
+FORCE_REINSTALL=0
 INSTALL_TMP=""
 PYTHON_BIN=""
+PYTHON_BIN_IS_ENV=0
 
 if [ -n "${CHATBRIDGE_PREFIX:-}" ]; then
   PREFIX_EXPLICIT=1
@@ -34,6 +36,7 @@ Options:
   --branch NAME       Source branch for --from-source. Default: main
   --repo URL          Source repository for --from-source.
   --bootstrap-rust    Install Rust with rustup when --from-source needs cargo.
+  --force-reinstall   Replace the install directory even when it does not look like a ChatBridge install.
   --uninstall         Remove ChatBridge launcher and installed package. Keeps config/history.
   -h, --help          Show this help.
 USAGE
@@ -90,6 +93,10 @@ while [ "$#" -gt 0 ]; do
       BOOTSTRAP_RUST=1
       shift
       ;;
+    --force-reinstall)
+      FORCE_REINSTALL=1
+      shift
+      ;;
     --uninstall)
       UNINSTALL=1
       shift
@@ -119,7 +126,8 @@ path_has_bin() {
   local path_entries
   wanted="${wanted%/}"
   IFS=':' read -r -a path_entries <<< "${PATH:-}"
-  for entry in "${path_entries[@]}"; do
+  # ${arr[@]+...} keeps bash 3.2 happy under `set -u` when the array is empty.
+  for entry in ${path_entries[@]+"${path_entries[@]}"}; do
     entry="${entry%/}"
     if [ "$entry" = "$wanted" ]; then
       return 0
@@ -173,7 +181,7 @@ choose_prefix() {
   done
 
   IFS=':' read -r -a path_entries <<< "${PATH:-}"
-  for bin in "${path_entries[@]}"; do
+  for bin in ${path_entries[@]+"${path_entries[@]}"}; do
     bin="${bin%/}"
     [ -n "$bin" ] || continue
     case "$bin" in
@@ -190,11 +198,28 @@ choose_prefix() {
   PREFIX="$HOME/.local"
 }
 
+python_probe() {
+  # 0 = >=3.10 system interpreter, 2 = too old, 3 = >=3.10 but inside a venv/conda env.
+  "$1" - <<'PY' >/dev/null 2>&1
+import sys
+
+if sys.version_info < (3, 10):
+    raise SystemExit(2)
+if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+    raise SystemExit(3)
+PY
+}
+
+python_path_is_conda() {
+  case "$1" in
+    *conda*|*Conda*|*anaconda*|*Anaconda*|*miniconda*|*Miniconda*|*mambaforge*|*Mambaforge*|*micromamba*|*Micromamba*|*/envs/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 need_python() {
-  local candidate resolved
+  local candidate resolved rc explicit="" env_fallback=""
   local candidates=(
-    "${CHATBRIDGE_PYTHON:-}"
-    "${PYTHON:-}"
     python3.14
     python3.13
     python3.12
@@ -206,22 +231,58 @@ need_python() {
     /usr/local/bin/python3
   )
 
+  if [ -n "${CHATBRIDGE_PYTHON:-}" ]; then
+    explicit="$CHATBRIDGE_PYTHON"
+  elif [ -n "${PYTHON:-}" ]; then
+    explicit="$PYTHON"
+  fi
+
+  if [ -n "$explicit" ]; then
+    if [ -x "$explicit" ] || command -v "$explicit" >/dev/null 2>&1; then
+      rc=0
+      python_probe "$explicit" || rc=$?
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+        resolved="$(command -v "$explicit" 2>/dev/null || true)"
+        PYTHON_BIN="${resolved:-$explicit}"
+        PYTHON_BIN_IS_ENV=0
+        return
+      fi
+      echo "chatbridge install: CHATBRIDGE_PYTHON/PYTHON points at $explicit, which is older than Python 3.10." >&2
+    else
+      echo "chatbridge install: CHATBRIDGE_PYTHON/PYTHON points at $explicit, which was not found." >&2
+    fi
+    exit 1
+  fi
+
   for candidate in "${candidates[@]}"; do
     [ -n "$candidate" ] || continue
     if [ -x "$candidate" ] || command -v "$candidate" >/dev/null 2>&1; then
-      if "$candidate" - <<'PY' >/dev/null 2>&1
-import sys
-
-if sys.version_info < (3, 10):
-    raise SystemExit(1)
-PY
-      then
-        resolved="$(command -v "$candidate" 2>/dev/null || true)"
-        PYTHON_BIN="${resolved:-$candidate}"
+      rc=0
+      python_probe "$candidate" || rc=$?
+      if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+        continue
+      fi
+      resolved="$(command -v "$candidate" 2>/dev/null || true)"
+      resolved="${resolved:-$candidate}"
+      if [ "$rc" -eq 0 ] && ! python_path_is_conda "$resolved"; then
+        PYTHON_BIN="$resolved"
+        PYTHON_BIN_IS_ENV=0
         return
+      fi
+      # >=3.10 but conda-managed or living inside a virtualenv: keep as last resort.
+      if [ -z "$env_fallback" ]; then
+        env_fallback="$resolved"
       fi
     fi
   done
+
+  if [ -n "$env_fallback" ]; then
+    PYTHON_BIN="$env_fallback"
+    PYTHON_BIN_IS_ENV=1
+    echo "chatbridge install: warning: only a conda/virtualenv Python was found: $env_fallback" >&2
+    echo "chatbridge install: warning: the chatbridge wrapper will pin this interpreter; set CHATBRIDGE_PYTHON to use another one." >&2
+    return
+  fi
 
   echo "chatbridge install: Python 3.10 or newer is required." >&2
   echo "Set CHATBRIDGE_PYTHON=/path/to/python3.10+ or install a newer Python." >&2
@@ -283,18 +344,31 @@ download_release_asset() {
 write_wrapper() {
   mkdir -p "$PREFIX/bin"
   local wrapper="$PREFIX/bin/chatbridge"
+  local prefix_q install_dir_q python_q
+  # %q-escape interpolated paths so quotes/dollars/backticks cannot break or
+  # inject into the generated wrapper. The escaped values are used in unquoted
+  # assignment context, where %q escaping is exact.
+  prefix_q="$(printf '%q' "$PREFIX")"
+  install_dir_q="$(printf '%q' "$INSTALL_DIR")"
+  python_q="$(printf '%q' "$PYTHON_BIN")"
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-export CHATBRIDGE_PREFIX="\${CHATBRIDGE_PREFIX:-$PREFIX}"
-export CHATBRIDGE_INSTALL_DIR="\${CHATBRIDGE_INSTALL_DIR:-$INSTALL_DIR}"
+CHATBRIDGE_DEFAULT_PREFIX=$prefix_q
+CHATBRIDGE_DEFAULT_INSTALL_DIR=$install_dir_q
+CHATBRIDGE_PYTHON_BIN=$python_q
+export CHATBRIDGE_PREFIX="\${CHATBRIDGE_PREFIX:-\$CHATBRIDGE_DEFAULT_PREFIX}"
+export CHATBRIDGE_INSTALL_DIR="\${CHATBRIDGE_INSTALL_DIR:-\$CHATBRIDGE_DEFAULT_INSTALL_DIR}"
 export CHATBRIDGE_INSTALLER_URL="\${CHATBRIDGE_INSTALLER_URL:-https://github.com/ylexLiao/chatbridge/releases/latest/download/install.sh}"
 export PYTHONPATH="\$CHATBRIDGE_INSTALL_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
-exec "$PYTHON_BIN" -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("chatbridge", run_name="__main__", alter_sys=True)' "\$CHATBRIDGE_INSTALL_DIR" "\$@"
+exec "\$CHATBRIDGE_PYTHON_BIN" -c 'import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module("chatbridge", run_name="__main__", alter_sys=True)' "\$CHATBRIDGE_INSTALL_DIR" "\$@"
 EOF
   chmod +x "$wrapper"
   echo "chatbridge installed: $wrapper"
   echo "Python: $PYTHON_BIN"
+  if [ "$PYTHON_BIN_IS_ENV" -eq 1 ]; then
+    echo "Note: the wrapper pins a conda/virtualenv Python; set CHATBRIDGE_PYTHON and re-run the installer to change it."
+  fi
   echo "Run: $wrapper paths doctor"
   case ":$PATH:" in
     *":$PREFIX/bin:"*) ;;
@@ -319,31 +393,81 @@ smoke_release_binary() {
 
 safe_remove_dir() {
   local dir="${1%/}"
-  if [ -z "$dir" ] || [ "$dir" = "/" ] || [ "$dir" = "$HOME" ] || [ "$dir" = "$PREFIX" ]; then
+  local prefix="${PREFIX%/}"
+  local home="${HOME%/}"
+  if [ -z "$dir" ] || [ "$dir" = "/" ] || [ "$dir" = "$home" ] || [ "$dir" = "$prefix" ]; then
     echo "chatbridge uninstall: refusing to remove unsafe directory: ${1:-<empty>}" >&2
     exit 2
   fi
+  case "$prefix/" in
+    "$dir"/*)
+      echo "chatbridge uninstall: refusing to remove $dir: it contains the install prefix $prefix" >&2
+      exit 2
+      ;;
+  esac
   rm -rf "$dir"
+}
+
+looks_like_chatbridge_install() {
+  local dir="$1"
+  [ -f "$dir/chatbridge/__init__.py" ] || [ -x "$dir/bin/chatbridge-tui" ] || [ -f "$dir/bin/chatbridge-tui.exe" ]
+}
+
+remove_install_dir() {
+  local label="$1"
+  if [ ! -d "$INSTALL_DIR" ]; then
+    return 0
+  fi
+  if [ "$FORCE_REINSTALL" -ne 1 ] && ! looks_like_chatbridge_install "$INSTALL_DIR"; then
+    echo "chatbridge $label: refusing to remove $INSTALL_DIR: it does not look like a ChatBridge install" >&2
+    echo "chatbridge $label: (expected chatbridge/__init__.py or bin/chatbridge-tui inside). Re-run with --force-reinstall to remove it anyway." >&2
+    exit 2
+  fi
+  safe_remove_dir "$INSTALL_DIR"
+}
+
+remove_launcher_pair() {
+  local wrapper="$1"
+  local removed=1
+  local legacy_tui
+  legacy_tui="$(dirname "$wrapper")/chatbridge-tui"
+  if [ -e "$wrapper" ] || [ -L "$wrapper" ]; then
+    rm -f "$wrapper"
+    echo "chatbridge uninstall: removed $wrapper"
+    removed=0
+  fi
+  if [ -e "$legacy_tui" ] || [ -L "$legacy_tui" ]; then
+    rm -f "$legacy_tui"
+    echo "chatbridge uninstall: removed $legacy_tui"
+    removed=0
+  fi
+  return "$removed"
 }
 
 uninstall_chatbridge() {
   local wrapper="$PREFIX/bin/chatbridge"
-  local legacy_tui="$PREFIX/bin/chatbridge-tui"
+  local on_path removed_any=0
 
-  if [ -e "$wrapper" ] || [ -L "$wrapper" ]; then
-    rm -f "$wrapper"
-    echo "chatbridge uninstall: removed $wrapper"
-  else
+  # Prefer the wrapper that is actually first on PATH, then the chosen prefix —
+  # but only when the user did not pin an explicit --prefix, so an uninstall
+  # scoped to a test prefix can never delete an unrelated global install.
+  if [ "$PREFIX_EXPLICIT" -eq 0 ]; then
+    on_path="$(command -v chatbridge 2>/dev/null || true)"
+    if [ -n "$on_path" ] && [ "$on_path" != "$wrapper" ]; then
+      if remove_launcher_pair "$on_path"; then
+        removed_any=1
+      fi
+    fi
+  fi
+  if remove_launcher_pair "$wrapper"; then
+    removed_any=1
+  fi
+  if [ "$removed_any" -eq 0 ]; then
     echo "chatbridge uninstall: launcher not found: $wrapper"
   fi
 
-  if [ -e "$legacy_tui" ] || [ -L "$legacy_tui" ]; then
-    rm -f "$legacy_tui"
-    echo "chatbridge uninstall: removed $legacy_tui"
-  fi
-
   if [ -d "$INSTALL_DIR" ]; then
-    safe_remove_dir "$INSTALL_DIR"
+    remove_install_dir uninstall
     echo "chatbridge uninstall: removed $INSTALL_DIR"
   else
     echo "chatbridge uninstall: install directory not found: $INSTALL_DIR"
@@ -358,6 +482,9 @@ install_release() {
   need_python
 
   local asset url tmp
+  if [ -n "$RELEASE_BASE" ] && [ "$VERSION" != "latest" ]; then
+    echo "chatbridge install: warning: CHATBRIDGE_RELEASE_BASE is set; it overrides --version $VERSION (assets come from ${RELEASE_BASE%/})." >&2
+  fi
   asset="$(detect_asset)"
   url="$(release_url "$asset")"
   tmp="$(mktemp -d)"
@@ -378,7 +505,7 @@ install_release() {
   fi
   smoke_release_binary "$tmp/chatbridge/bin/chatbridge-tui"
 
-  rm -rf "$INSTALL_DIR"
+  remove_install_dir install
   mkdir -p "$(dirname "$INSTALL_DIR")"
   mv "$tmp/chatbridge" "$INSTALL_DIR"
   write_wrapper

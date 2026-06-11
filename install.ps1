@@ -1,12 +1,14 @@
 param(
-  [string]$Prefix = "",
-  [string]$InstallDir = "$HOME\.local\share\chatbridge",
-  [string]$Version = "latest",
+  [string]$Prefix = $(if (-not [string]::IsNullOrWhiteSpace($env:CHATBRIDGE_PREFIX)) { $env:CHATBRIDGE_PREFIX } else { "" }),
+  [string]$InstallDir = $(if (-not [string]::IsNullOrWhiteSpace($env:CHATBRIDGE_INSTALL_DIR)) { $env:CHATBRIDGE_INSTALL_DIR } else { "$HOME\.local\share\chatbridge" }),
+  [string]$Version = $(if (-not [string]::IsNullOrWhiteSpace($env:CHATBRIDGE_VERSION)) { $env:CHATBRIDGE_VERSION } else { "latest" }),
+  [switch]$ForceReinstall,
   [switch]$Uninstall
 )
 
 $ErrorActionPreference = "Stop"
 $Repo = "ylexLiao/chatbridge"
+$ReleaseBase = $env:CHATBRIDGE_RELEASE_BASE
 $PythonCommand = $null
 $PythonArgs = @()
 $PrefixExplicit = -not [string]::IsNullOrWhiteSpace($Prefix)
@@ -17,19 +19,40 @@ function Need($Command) {
   }
 }
 
-function TestPython($Command, [string[]]$Args) {
+function ProbePython($Command, [string[]]$Args) {
+  # Returns "ok" (>=3.10 system interpreter), "env" (>=3.10 but venv/conda), or "bad".
   if ([string]::IsNullOrWhiteSpace($Command)) {
-    return $false
+    return "bad"
   }
   if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
-    return $false
+    return "bad"
   }
   try {
-    & $Command @Args -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" | Out-Null
-    return $LASTEXITCODE -eq 0
+    & $Command @Args -c "import sys; sys.exit(2 if sys.version_info < (3, 10) else (3 if sys.prefix != getattr(sys, 'base_prefix', sys.prefix) else 0))" | Out-Null
+    switch ($LASTEXITCODE) {
+      0 { return "ok" }
+      3 { return "env" }
+      default { return "bad" }
+    }
   } catch {
+    return "bad"
+  }
+}
+
+function PythonPathIsConda($Command) {
+  $source = (Get-Command $Command -ErrorAction SilentlyContinue).Source
+  if ([string]::IsNullOrWhiteSpace($source)) {
     return $false
   }
+  $lower = $source.ToLowerInvariant()
+  return (
+    $lower.Contains("conda") -or
+    $lower.Contains("anaconda") -or
+    $lower.Contains("miniconda") -or
+    $lower.Contains("mambaforge") -or
+    $lower.Contains("micromamba") -or
+    $lower.Contains("\envs\")
+  )
 }
 
 function UsePython($Command, [string[]]$Args) {
@@ -38,18 +61,46 @@ function UsePython($Command, [string[]]$Args) {
 }
 
 function FindPython {
-  foreach ($candidate in @($env:CHATBRIDGE_PYTHON, $env:PYTHON, "python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3", "python")) {
-    if (TestPython -Command $candidate -Args @()) {
+  foreach ($candidate in @($env:CHATBRIDGE_PYTHON, $env:PYTHON)) {
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+      continue
+    }
+    if ((ProbePython -Command $candidate -Args @()) -ne "bad") {
       UsePython -Command $candidate -Args @()
       return
+    }
+    throw "chatbridge install: CHATBRIDGE_PYTHON/PYTHON points at $candidate, which is missing or older than Python 3.10."
+  }
+
+  $envFallback = $null
+  $envFallbackArgs = @()
+  foreach ($candidate in @("python3.14", "python3.13", "python3.12", "python3.11", "python3.10", "python3", "python")) {
+    $probe = ProbePython -Command $candidate -Args @()
+    if ($probe -eq "bad") {
+      continue
+    }
+    if ($probe -eq "ok" -and -not (PythonPathIsConda $candidate)) {
+      UsePython -Command $candidate -Args @()
+      return
+    }
+    if ($null -eq $envFallback) {
+      $envFallback = $candidate
+      $envFallbackArgs = @()
     }
   }
 
   foreach ($version in @("3.14", "3.13", "3.12", "3.11", "3.10")) {
-    if (TestPython -Command "py" -Args @("-$version")) {
+    if ((ProbePython -Command "py" -Args @("-$version")) -eq "ok") {
       UsePython -Command "py" -Args @("-$version")
       return
     }
+  }
+
+  if ($null -ne $envFallback) {
+    UsePython -Command $envFallback -Args $envFallbackArgs
+    Write-Warning "chatbridge install: only a conda/virtualenv Python was found: $script:PythonCommand"
+    Write-Warning "chatbridge install: the chatbridge launcher will pin this interpreter; set CHATBRIDGE_PYTHON to use another one."
+    return
   }
 
   throw "chatbridge install: Python 3.10 or newer is required. Set CHATBRIDGE_PYTHON=C:\Path\To\python.exe or install a newer Python."
@@ -68,20 +119,32 @@ function PathHasBin($Bin) {
   return $false
 }
 
+function DirIsWritable($Dir) {
+  try {
+    $probe = Join-Path $Dir (".chatbridge-write-test-" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType File -Path $probe -Force | Out-Null
+    Remove-Item $probe -Force
+    return $true
+  } catch {
+    return $false
+  }
+}
+
 function BinIsWritableOrCreatable($Bin) {
+  if (Test-Path $Bin -PathType Container) {
+    return DirIsWritable $Bin
+  }
   if (Test-Path $Bin) {
-    try {
-      $probe = Join-Path $Bin (".chatbridge-write-test-" + [System.Guid]::NewGuid().ToString("N"))
-      New-Item -ItemType File -Path $probe -Force | Out-Null
-      Remove-Item $probe -Force
-      return $true
-    } catch {
-      return $false
-    }
+    return $false
   }
 
+  # Mirror install.sh: only allow creating the bin dir when its immediate parent
+  # already exists and is writable.
   $parent = Split-Path $Bin -Parent
-  return (Test-Path $parent) -and (BinIsWritableOrCreatable $parent)
+  if ([string]::IsNullOrWhiteSpace($parent) -or -not (Test-Path $parent -PathType Container)) {
+    return $false
+  }
+  return DirIsWritable $parent
 }
 
 function IgnoredPathBin($Bin) {
@@ -138,6 +201,14 @@ function QuotePs($Value) {
 }
 
 function DownloadWithRetry($Uri, $OutFile) {
+  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+  if ($curl) {
+    & $curl.Source --http1.1 -fL --retry 3 --retry-delay 2 --retry-max-time 120 $Uri -o $OutFile
+    if ($LASTEXITCODE -eq 0) {
+      return
+    }
+    Write-Warning "chatbridge install: curl.exe download failed (exit $LASTEXITCODE); retrying with Invoke-WebRequest."
+  }
   $attempts = 3
   for ($attempt = 1; $attempt -le $attempts; $attempt++) {
     try {
@@ -158,30 +229,74 @@ function SafeRemoveDir($Dir) {
   $resolved = [System.IO.Path]::GetFullPath($Dir)
   $homeResolved = [System.IO.Path]::GetFullPath($HOME)
   $prefixResolved = [System.IO.Path]::GetFullPath($Prefix)
+  $prefixWithSep = $prefixResolved.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+  $resolvedWithSep = $resolved.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
   if (
     [string]::IsNullOrWhiteSpace($resolved) -or
     [string]::Equals($resolved, [System.IO.Path]::GetPathRoot($resolved), [System.StringComparison]::OrdinalIgnoreCase) -or
     [string]::Equals($resolved, $homeResolved, [System.StringComparison]::OrdinalIgnoreCase) -or
-    [string]::Equals($resolved, $prefixResolved, [System.StringComparison]::OrdinalIgnoreCase)
+    [string]::Equals($resolved, $prefixResolved, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $prefixWithSep.StartsWith($resolvedWithSep, [System.StringComparison]::OrdinalIgnoreCase)
   ) {
     throw "chatbridge uninstall: refusing to remove unsafe directory: $Dir"
   }
   Remove-Item -Recurse -Force $resolved
 }
 
+function LooksLikeChatBridgeInstall($Dir) {
+  return (
+    (Test-Path (Join-Path $Dir "chatbridge\__init__.py")) -or
+    (Test-Path (Join-Path $Dir "bin\chatbridge-tui.exe")) -or
+    (Test-Path (Join-Path $Dir "bin\chatbridge-tui"))
+  )
+}
+
+function RemoveInstallDir($Label) {
+  if (-not (Test-Path $InstallDir)) {
+    return
+  }
+  if (-not $ForceReinstall -and -not (LooksLikeChatBridgeInstall $InstallDir)) {
+    throw ("chatbridge ${Label}: refusing to remove ${InstallDir}: it does not look like a ChatBridge install " +
+      "(expected chatbridge\__init__.py or bin\chatbridge-tui.exe inside). Re-run with -ForceReinstall to remove it anyway.")
+  }
+  SafeRemoveDir $InstallDir
+}
+
 function UninstallChatBridge {
-  $bin = Join-Path $Prefix "bin"
-  foreach ($launcher in @((Join-Path $bin "chatbridge.cmd"), (Join-Path $bin "chatbridge.ps1"))) {
-    if (Test-Path $launcher) {
-      Remove-Item -Force $launcher
-      Write-Host "chatbridge uninstall: removed $launcher"
-    } else {
-      Write-Host "chatbridge uninstall: launcher not found: $launcher"
+  $binDirs = New-Object System.Collections.Generic.List[string]
+  # Only consult PATH when no explicit -Prefix was given, so an uninstall scoped
+  # to a test prefix can never delete an unrelated global install.
+  if (-not $script:PrefixExplicit) {
+    $existing = Get-Command chatbridge -ErrorAction SilentlyContinue
+    if ($existing -and $existing.Source) {
+      $binDirs.Add((Split-Path $existing.Source -Parent))
     }
+  }
+  $binDirs.Add((Join-Path $Prefix "bin"))
+
+  $seen = @{}
+  $removedAny = $false
+  foreach ($binDir in $binDirs) {
+    $key = $binDir.ToLowerInvariant().TrimEnd('\')
+    if ($seen.ContainsKey($key)) {
+      continue
+    }
+    $seen[$key] = $true
+    foreach ($name in @("chatbridge.cmd", "chatbridge.ps1", "chatbridge-tui.exe", "chatbridge-tui")) {
+      $launcher = Join-Path $binDir $name
+      if (Test-Path $launcher) {
+        Remove-Item -Force $launcher
+        Write-Host "chatbridge uninstall: removed $launcher"
+        $removedAny = $true
+      }
+    }
+  }
+  if (-not $removedAny) {
+    Write-Host ("chatbridge uninstall: launcher not found: " + (Join-Path (Join-Path $Prefix "bin") "chatbridge.cmd"))
   }
 
   if (Test-Path $InstallDir) {
-    SafeRemoveDir $InstallDir
+    RemoveInstallDir "uninstall"
     Write-Host "chatbridge uninstall: removed $InstallDir"
   } else {
     Write-Host "chatbridge uninstall: install directory not found: $InstallDir"
@@ -204,7 +319,12 @@ if ($arch -eq "AMD64" -or $arch -eq "x86_64") {
   throw "chatbridge install: unsupported Windows architecture: $arch"
 }
 
-if ($Version -eq "latest") {
+if (-not [string]::IsNullOrWhiteSpace($ReleaseBase)) {
+  if ($Version -ne "latest") {
+    Write-Warning "chatbridge install: CHATBRIDGE_RELEASE_BASE is set; it overrides version $Version (assets come from $($ReleaseBase.TrimEnd('/')))."
+  }
+  $url = "$($ReleaseBase.TrimEnd('/'))/$asset"
+} elseif ($Version -eq "latest") {
   $url = "https://github.com/$Repo/releases/latest/download/$asset"
 } else {
   $url = "https://github.com/$Repo/releases/download/$Version/$asset"
@@ -230,8 +350,16 @@ try {
   $oldSmoke = $env:CHATBRIDGE_TUI_SMOKE
   try {
     $env:CHATBRIDGE_TUI_SMOKE = "1"
-    & $tui | Out-Null
+    # Relax EAP: under "Stop", 2>&1 on a native command can throw on the first
+    # stderr line in Windows PowerShell 5.1 before we can show the output.
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $smokeOutput = & $tui 2>&1
+    $ErrorActionPreference = $oldEap
     if ($LASTEXITCODE -ne 0) {
+      if ($smokeOutput) {
+        Write-Host (($smokeOutput | ForEach-Object { "$_" }) -join [System.Environment]::NewLine)
+      }
       throw "chatbridge install: bundled TUI binary is not runnable on this machine."
     }
   } finally {
@@ -242,9 +370,7 @@ try {
     }
   }
 
-  if (Test-Path $InstallDir) {
-    Remove-Item -Recurse -Force $InstallDir
-  }
+  RemoveInstallDir "install"
   New-Item -ItemType Directory -Path (Split-Path $InstallDir -Parent) -Force | Out-Null
   Move-Item $payload $InstallDir
 
@@ -266,7 +392,11 @@ try {
     "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_PREFIX)) { `$env:CHATBRIDGE_PREFIX = $prefixLiteral }",
     "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_INSTALL_DIR)) { `$env:CHATBRIDGE_INSTALL_DIR = $installDirLiteral }",
     "if ([string]::IsNullOrWhiteSpace(`$env:CHATBRIDGE_INSTALLER_URL)) { `$env:CHATBRIDGE_INSTALLER_URL = 'https://github.com/ylexLiao/chatbridge/releases/latest/download/install.ps1' }",
-    "`$env:PYTHONPATH = `$env:CHATBRIDGE_INSTALL_DIR + [System.IO.Path]::PathSeparator + `$env:PYTHONPATH",
+    "if ([string]::IsNullOrEmpty(`$env:PYTHONPATH)) {",
+    "  `$env:PYTHONPATH = `$env:CHATBRIDGE_INSTALL_DIR",
+    "} else {",
+    "  `$env:PYTHONPATH = `$env:CHATBRIDGE_INSTALL_DIR + [System.IO.Path]::PathSeparator + `$env:PYTHONPATH",
+    "}",
     "`$pythonCommand = $pythonCommandLiteral",
     "`$pythonArgs = @($pythonArgsLiteral)",
     "& `$pythonCommand @pythonArgs -c `$bootstrap `$env:CHATBRIDGE_INSTALL_DIR @args",

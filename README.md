@@ -27,6 +27,7 @@ It does not call a cloud service by default. It reads and writes local history f
 - Browse recovered Copilot, Codex, and Claude Code sessions without loading every full transcript.
 - Generate handoff prompts when you want another agent to continue.
 - Native-import sessions into the target tool's local history format.
+- Export a session as a portable JSON bundle and import it on another machine (for example over SSH).
 - Repair old imports that are missing index, cache, or JSONL files.
 - Diagnose local history paths for VS Code, Insiders, VSCodium, Cursor, Codex, and Claude Code.
 - Replace embedded image base64 with readable attachment placeholders instead of dumping huge text into chats.
@@ -60,6 +61,8 @@ Update an existing release-installer install:
 chatbridge update
 chatbridge --version
 ```
+
+`chatbridge update` re-downloads the release installer for your platform and reinstalls ChatBridge in place.
 
 Prebuilt release assets currently target macOS arm64/x64, Linux arm64/x64, and Windows x64. Linux release binaries are built with musl to avoid requiring a newer system glibc. Other platforms can use the source build path.
 
@@ -158,7 +161,14 @@ chatbridge native-import --from codex --to claude --session <session-id> --apply
 chatbridge native-import --from claude --to copilot --session <session-id> --project /path/to/repo --apply
 ```
 
-`native-import` is a dry run unless `--apply` is provided.
+`native-import` is a dry run unless `--apply` is provided. By default the import lands in the session's own project path (the project recorded in the source history), regardless of your current directory; pass `--project` to choose a different destination project. Dry runs print a `Target project:` line so you can check the destination first.
+
+Export a session as a portable bundle and import it elsewhere:
+
+```bash
+chatbridge export --from copilot --session <session-id>
+chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to claude --apply
+```
 
 ## Supported Sources And Targets
 
@@ -170,7 +180,7 @@ chatbridge native-import --from claude --to copilot --session <session-id> --pro
 
 ## Path Setup
 
-Inside the TUI, press `P` to open the path setup form. Choose the target path, type the directory, and press `Enter` to save it.
+Inside the TUI, press `P` to open the path setup form. Choose the target path, type the directory, and press `Enter` to save it. Press `Ctrl+D` inside the form to run the same diagnostics as `chatbridge paths doctor` (the old `?` shortcut now types a literal `?` into the path input).
 
 ```bash
 chatbridge paths doctor
@@ -188,7 +198,10 @@ Environment variables are also supported:
 CHATBRIDGE_COPILOT_WORKSPACE_STORAGE=/path/to/workspaceStorage
 CHATBRIDGE_CODEX_HOME=/path/to/.codex
 CHATBRIDGE_CLAUDE_HOME=/path/to/.claude
+CHATBRIDGE_API_TIMEOUT=120
 ```
+
+`CHATBRIDGE_API_TIMEOUT` sets the timeout in seconds for the backend commands the TUI runs (default 120). You can also press `Esc` to cancel a long-running load early.
 
 ## Native Import Safety
 
@@ -207,6 +220,33 @@ chatbridge repair-codex-imports --apply
 chatbridge repair-claude-imports --apply
 chatbridge repair-copilot-imports --apply
 ```
+
+## Export Bundles And Remote Machines
+
+`chatbridge export` writes one session to a portable JSON bundle (`"format": "chatbridge-bundle"`, `"version": 1`):
+
+```bash
+chatbridge export --from copilot --session <session-id>
+# -> ./chatbridge-export-copilot-<session-id>.json  (use --out PATH to change it)
+```
+
+The bundle stores the session metadata (source, title, project path, timestamps) plus its messages and artifacts. Text is redacted and embedded base64 images are replaced with placeholders before the file is written, so the bundle is safe to move between machines. In the TUI, every source offers an `Export bundle (.json)` option in the target picker.
+
+To continue a local session on a remote machine (Remote SSH and similar):
+
+```bash
+# 1. Local machine: export the session
+chatbridge export --from copilot --session <session-id>
+
+# 2. Copy the bundle to the remote machine
+scp chatbridge-export-copilot-<session-id>.json remote:
+
+# 3. Remote machine: import the bundle natively (no source history needed there)
+chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to codex --apply
+chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to claude --apply
+```
+
+When the bundled session's project is a `vscode-remote://` URI, importing to Codex or Claude Code automatically translates it to the remote filesystem path (for example `vscode-remote://ssh-remote%2Bbox/home/ubuntu/app` becomes `/home/ubuntu/app`). Pass `--project` to override the destination project.
 
 ## Copilot Local And Remote Workspaces
 
@@ -240,6 +280,7 @@ npm pack --dry-run
 ```
 
 ## Acknowledgments
+
 Thanks for the help from LINUXDO: https://linux.do
 
 ## License

@@ -7,11 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .export import load_bundle, write_bundle
 from .models import Session
 from .parsers import SUPPORTED_SOURCES, count_sessions, find_session, load_sessions
 from .paths import path_doctor, set_path_overrides
 from .summary import build_handoff
-from .writers import native_import
+from .util import timestamp_sort_key
+from .writers import NativeImportError, native_import
 
 TARGETS = {"copilot", "codex", "claude"}
 
@@ -33,9 +35,10 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     handoff_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
 
     native_cmd = api_sub.add_parser("native-import", help="Run native import as JSON.")
-    native_cmd.add_argument("--from", dest="source", required=True, choices=sorted(SUPPORTED_SOURCES))
+    native_cmd.add_argument("--from", dest="source", choices=sorted(SUPPORTED_SOURCES))
     native_cmd.add_argument("--to", dest="target", required=True, choices=sorted(TARGETS))
     native_cmd.add_argument("--session")
+    native_cmd.add_argument("--bundle")
     native_cmd.add_argument("--project")
     native_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
     native_cmd.add_argument("--allow-duplicate", action="store_true")
@@ -43,6 +46,12 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     mode = native_cmd.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
+
+    export_cmd = api_sub.add_parser("export", help="Export a session to a portable bundle as JSON.")
+    export_cmd.add_argument("--from", dest="source", required=True, choices=sorted(SUPPORTED_SOURCES))
+    export_cmd.add_argument("--session")
+    export_cmd.add_argument("--project")
+    export_cmd.add_argument("--out")
 
     paths_cmd = api_sub.add_parser("paths", help="Inspect configured history paths as JSON.")
     paths_sub = paths_cmd.add_subparsers(dest="paths_command", required=True)
@@ -61,9 +70,15 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
             sessions = load_sessions(args.source, home, metadata_only=True, limit=limit if fast_limited else None)
             if args.project:
                 sessions = [s for s in sessions if s.project_path == args.project]
-            sessions = sorted(sessions, key=lambda s: str(s.updated_at or s.created_at or ""), reverse=True)
+            sessions = sorted(
+                sessions,
+                key=lambda s: timestamp_sort_key(s.updated_at if s.updated_at not in (None, "") else s.created_at),
+                reverse=True,
+            )
             visible = sessions[:limit]
-            total = count_sessions(args.source, home, args.project)
+            # With a project filter the filtered list itself is the ground truth;
+            # count_sessions enumerates by a different mechanism and can disagree.
+            total = len(sessions) if args.project else count_sessions(args.source, home, None)
             return _write_ok(
                 {
                     "sessions": [_session_to_api(session, args.source) for session in visible],
@@ -76,8 +91,17 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
         if args.api_command == "handoff":
             session = find_session(args.source, home, args.session, args.project)
             return _write_ok({"text": build_handoff(session, args.target, args.level)})
+        if args.api_command == "export":
+            session = find_session(args.source, home, args.session, args.project)
+            bundle_path = write_bundle(session, Path(args.out).expanduser() if args.out else None)
+            return _write_ok({"text": f"Exported {session.source_label} session {session.session_id} to {bundle_path}"})
         if args.api_command == "native-import":
-            session = find_session(args.source, home, args.session, None)
+            if args.bundle:
+                session = load_bundle(Path(args.bundle))
+            elif args.source:
+                session = find_session(args.source, home, args.session, None)
+            else:
+                raise SystemExit("Provide --from SOURCE or --bundle FILE.")
             text = native_import(
                 session,
                 args.target,
@@ -101,6 +125,8 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
                 claude_home=args.claude_home,
             )
             return _write_ok({"text": f"Wrote ChatBridge path config: {config_path}\n\n{path_doctor(home)}"})
+    except NativeImportError as exc:
+        return _write_error(str(exc), exc.kind, next_title=getattr(exc, "next_title", None))
     except SystemExit as exc:
         return _write_error(str(exc), _error_kind(str(exc)))
     except Exception as exc:
@@ -141,15 +167,15 @@ def _write_ok(data: dict[str, Any]) -> int:
     return _write_json({"ok": True, "data": data})
 
 
-def _write_error(message: str, kind: str) -> int:
+def _write_error(message: str, kind: str, next_title: str | None = None) -> int:
     payload: dict[str, Any] = {
         "ok": False,
         "kind": kind,
         "message": message,
     }
-    next_title = _extract_next_title(message)
-    if next_title:
-        payload["nextTitle"] = next_title
+    resolved_title = next_title or _extract_next_title(message)
+    if resolved_title:
+        payload["nextTitle"] = resolved_title
     return _write_json(payload)
 
 

@@ -29,6 +29,11 @@ def update_release_install(version: str = "latest") -> int:
     ).strip()
     if not installer_url:
         raise SystemExit("chatbridge update: CHATBRIDGE_INSTALLER_URL is empty.")
+    release_base = os.environ.get("CHATBRIDGE_RELEASE_BASE", "").strip()
+    if release_base and version != "latest":
+        print(
+            f"chatbridge update: warning: CHATBRIDGE_RELEASE_BASE is set; assets come from {release_base} regardless of --version {version}."
+        )
 
     print(f"chatbridge update: installing {version} into {install_dir}")
     with tempfile.TemporaryDirectory(prefix="chatbridge-update-") as temp_dir:
@@ -44,12 +49,23 @@ def _download_installer(url: str, output: Path) -> None:
     local_path = Path(url).expanduser()
     if "://" not in url and local_path.exists():
         output.write_bytes(local_path.read_bytes())
-        return
-    try:
-        with urllib.request.urlopen(url, timeout=60) as response:
-            output.write_bytes(response.read())
-    except Exception as exc:  # pragma: no cover - exact network errors vary by platform
-        raise SystemExit(f"chatbridge update: failed to download installer: {exc}") from exc
+    else:
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                output.write_bytes(response.read())
+        except Exception as exc:  # pragma: no cover - exact network errors vary by platform
+            raise SystemExit(f"chatbridge update: failed to download installer: {exc}") from exc
+    _check_installer_content(url, output)
+
+
+def _check_installer_content(url: str, output: Path) -> None:
+    data = output.read_bytes()
+    if not data.strip():
+        raise SystemExit(f"chatbridge update: downloaded installer is empty: {url}")
+    if output.suffix == ".sh" and not data.lstrip().startswith(b"#!"):
+        raise SystemExit(f"chatbridge update: downloaded installer does not look like a shell script: {url}")
+    if output.suffix == ".ps1" and b"param" not in data[:4000].lower():
+        raise SystemExit(f"chatbridge update: downloaded installer does not look like a PowerShell script: {url}")
 
 
 def _run_unix_installer(installer_path: Path, prefix: str, install_dir: str, version: str) -> int:

@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote
 from .models import Session
 from .paths import resolve_paths
 from .summary import build_handoff
-from .util import append_jsonl, backup_paths, iter_jsonl, now_iso, project_to_claude_slug, read_json, redact, sanitize_embedded_images, text_from_any, write_jsonl
+from .util import append_jsonl, backup_paths, iter_jsonl, now_iso, parse_timestamp, project_to_claude_slug, read_json, redact, sanitize_embedded_images, text_from_any, write_jsonl
 
 IMPORT_MARKER = "Imported by ChatBridge. Treat this as context, not verified fact."
 LEGACY_IMPORT_MARKER = "Imported by ChatNBridge. Treat this as context, not verified fact."
@@ -28,6 +28,24 @@ CODEX_EXTERNAL_IMPORT_MARKER = "<EXTERNAL SESSION IMPORTED>"
 COPILOT_CHAT_INDEX_KEY = "chat.ChatSessionStore.index"
 COPILOT_AGENT_CACHE_KEY = "agentSessions.model.cache"
 COPILOT_AGENT_STATE_KEY = "agentSessions.state.cache"
+
+
+class NativeImportError(SystemExit):
+    """Structured native-import failure consumed by the JSON api layer."""
+
+    kind = "error"
+
+
+class DuplicateImportError(NativeImportError):
+    kind = "duplicate"
+
+    def __init__(self, message: str, next_title: str) -> None:
+        super().__init__(message)
+        self.next_title = next_title
+
+
+class VSCodeRunningError(NativeImportError):
+    kind = "vscode_running"
 
 
 @dataclass(frozen=True)
@@ -53,47 +71,66 @@ def native_import(
     project_path = _native_import_target_project(session, target, home, project)
     if not apply:
         mode = "structured transcript" if _project_session_messages(session) else "handoff fallback"
-        return f"DRY RUN: would import {session.source_label} session {session.session_id} into {target} using {mode}.\n\n{handoff}"
+        return (
+            f"DRY RUN: would import {session.source_label} session {session.session_id} into {target} using {mode}.\n"
+            f"Target project: {project_path}\n\n{handoff}"
+        )
     existing_titles = _native_import_existing_titles(target, home, project_path, base_title)
     if existing_titles:
         next_title = _next_native_import_title(base_title, existing_titles)
         if not allow_duplicate:
-            raise SystemExit(
+            raise DuplicateImportError(
                 f"Duplicate native import detected for {base_title} into {target} project {project_path}.\n"
-                f"Use --allow-duplicate to import another copy as {next_title}."
+                f"Use --allow-duplicate to import another copy as {next_title}.",
+                next_title,
             )
         title = next_title
     if target == "codex":
-        return _write_codex(session, home, title, handoff, project_path)
+        return _insert_target_project_line(_write_codex(session, home, title, handoff, project_path), project_path)
     if target == "claude":
-        return _write_claude(session, home, title, handoff, project_path)
+        return _insert_target_project_line(_write_claude(session, home, title, handoff, project_path), project_path)
     if target == "copilot":
-        return _write_copilot(session, home, title, handoff, project_path, force_running_vscode=force_running_vscode)
+        return _insert_target_project_line(
+            _write_copilot(session, home, title, handoff, project_path, force_running_vscode=force_running_vscode),
+            project_path,
+        )
     raise SystemExit(f"Unsupported native import target: {target}")
+
+
+def _insert_target_project_line(text: str, project_path: str) -> str:
+    head, sep, tail = text.partition("\n")
+    if not sep:
+        return f"{text}\nTarget project: {project_path}\n"
+    return f"{head}{sep}Target project: {project_path}\n{tail}"
 
 
 def _native_import_target_project(session: Session, target: str, home: Path, project: str | None) -> str:
     if project:
         return project
-    if target == "claude":
-        current_project = _current_directory_project(home)
-        if current_project:
-            return current_project
-    if target == "copilot":
-        storage = resolve_paths(home).copilot_workspace_storage
-        match = _copilot_project_from_current_context(storage, home)
-        if match:
-            return match
-    return session.project_path or _current_directory_project(home) or str(home)
+    session_project = str(session.project_path or "").strip()
+    if session_project:
+        if target in {"codex", "claude"}:
+            local = _vscode_remote_to_local_path(session_project)
+            if local:
+                return local
+        return session_project
+    return _current_directory_project(home) or str(home)
 
 
-def _copilot_project_from_current_context(storage: Path, home: Path) -> str | None:
-    if not storage.exists():
+def _vscode_remote_to_local_path(value: str) -> str | None:
+    """Map vscode-remote://<authority>/<path> to the filesystem path component.
+
+    Used when importing into filesystem-rooted tools (Codex/Claude): on the
+    machine the remote URI points at, the trailing path is the local project.
+    """
+    if not value.startswith("vscode-remote://"):
         return None
-    for candidate in _current_project_candidates(home):
-        if _find_copilot_workspace(storage, candidate) is not None:
-            return candidate
-    return None
+    rest = value[len("vscode-remote://") :]
+    slash = rest.find("/")
+    if slash == -1:
+        return None
+    path = unquote(rest[slash:])
+    return path or None
 
 
 def _current_project_candidates(home: Path) -> list[str]:
@@ -349,9 +386,74 @@ def repair_claude_imports(home: Path, apply: bool) -> str:
     write_jsonl(history_path, history_rows)
 
     for row in rows:
-        target = Path(str(row["target_path"]))
-        _write_claude_session_rows(target, str(row["new_session_id"]), str(row["title"]), str(row["handoff"]), str(row["project_path"]))
+        _repair_claude_session_file(row)
     return f"Repaired {len(rows)} Claude Code imported session(s).\nBackup: {backup}\n"
+
+
+def _repair_claude_session_file(row: dict[str, Any]) -> None:
+    target = Path(str(row["target_path"]))
+    old_path = Path(str(row["old_path"])) if row.get("old_path") else None
+    new_sid = str(row["new_session_id"])
+    title = str(row["title"])
+    project_path = str(row["project_path"])
+    preserved = _claude_preserved_message_rows(old_path)
+    if preserved:
+        _write_claude_repaired_rows(target, new_sid, title, project_path, preserved)
+    else:
+        _write_claude_session_rows(target, new_sid, title, str(row["handoff"]), project_path)
+    if old_path and old_path.exists() and old_path.resolve() != target.resolve():
+        old_path.unlink()
+
+
+def _claude_preserved_message_rows(path: Path | None) -> list[dict[str, Any]]:
+    """Collect original user/assistant rows so repair keeps the full transcript."""
+    if not path or not path.exists():
+        return []
+    preserved: list[dict[str, Any]] = []
+    for row in iter_jsonl(path):
+        if not isinstance(row, dict) or row.get("type") not in {"user", "assistant"}:
+            continue
+        message = row.get("message")
+        if not message or not isinstance(message, (dict, str)):
+            continue
+        preserved.append(dict(row))
+    return preserved
+
+
+def _write_claude_repaired_rows(target: Path, sid: str, title: str, project_path: str, message_rows: list[dict[str, Any]]) -> None:
+    version = _claude_native_version(target.parent.parent)
+    timestamp = now_iso()
+    rows: list[dict[str, Any]] = []
+    parent_uuid: str | None = None
+    leaf_uuid: str | None = None
+    for original in message_rows:
+        row = dict(original)
+        row["sessionId"] = sid
+        row["cwd"] = project_path
+        row.setdefault("isSidechain", False)
+        row.setdefault("userType", "external")
+        row.setdefault("entrypoint", "cli")
+        row.setdefault("gitBranch", "HEAD")
+        row.setdefault("version", version)
+        row.setdefault("timestamp", timestamp)
+        row_uuid = str(row.get("uuid") or uuid.uuid4())
+        row["uuid"] = row_uuid
+        row["parentUuid"] = parent_uuid
+        message = row.get("message")
+        if isinstance(message, str):
+            if row.get("type") == "user":
+                row["message"] = {"role": "user", "content": message}
+            else:
+                row["message"] = _claude_message_payload("assistant", message, row_uuid)
+        rows.append(row)
+        parent_uuid = row_uuid
+        leaf_uuid = row_uuid
+    rows.extend([
+        {"type": "last-prompt", "lastPrompt": title, "leafUuid": leaf_uuid, "sessionId": sid},
+        {"type": "mode", "mode": "normal", "sessionId": sid},
+        {"type": "permission-mode", "permissionMode": "default", "sessionId": sid},
+    ])
+    write_jsonl(target, rows)
 
 
 def _project_session_messages(session: Session) -> list[ProjectedMessage]:
@@ -695,23 +797,9 @@ def _format_source_start_time(value: Any) -> str:
     return f"{local.strftime('%Y-%m-%d %H:%M')} {zone}".rstrip()
 
 
-def _source_datetime(value: Any) -> datetime | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, (int, float)):
-        seconds = float(value) / 1000 if float(value) > 100000000000 else float(value)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
-    text = str(value).strip()
-    if text.isdigit():
-        return _source_datetime(int(text))
-    parsed = text.replace("Z", "+00:00") if text.endswith("Z") else text
-    try:
-        dt = datetime.fromisoformat(parsed)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        return dt.astimezone()
-    return dt
+# Shared timestamp parsing lives in util.parse_timestamp; keep the local name
+# used throughout this module.
+_source_datetime = parse_timestamp
 
 
 def _format_utc_offset(value: datetime) -> str:
@@ -1133,8 +1221,9 @@ def _claude_native_version(root: Path) -> str:
     projects = root / "projects" if root.name == ".claude" else root
     if not projects.exists():
         return "2.1.0"
-    for candidate in sorted(projects.rglob("*.jsonl"), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True):
-        if "/subagents/" in str(candidate):
+    candidates = sorted(projects.rglob("*.jsonl"), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    for candidate in candidates[:50]:
+        if "subagents" in candidate.parts:
             continue
         for row in iter_jsonl(candidate):
             if isinstance(row, dict) and row.get("version"):
@@ -1182,7 +1271,7 @@ def _find_claude_session_file(root: Path, sid: str) -> Path | None:
     if not projects.exists():
         return None
     for path in projects.rglob(f"{sid}.jsonl"):
-        if "/subagents/" not in str(path):
+        if "subagents" not in path.parts:
             return path
     return None
 
@@ -1248,7 +1337,7 @@ def _write_copilot(
     chat_dir = workspace / "chatSessions"
     backup = backup_paths(home, [chat_dir, workspace / "state.vscdb", workspace / "state.vscdb.backup"])
     sid = str(uuid.uuid4())
-    now_ms = int(__import__("time").time() * 1000)
+    now_ms = int(time.time() * 1000)
     requests = _copilot_projected_requests(session, handoff, now_ms)
     created_ms = _source_timestamp_ms(session.created_at, now_ms)
     updated_ms = _source_timestamp_ms(session.updated_at, requests[-1]["timestamp"] if requests else now_ms)
@@ -1400,7 +1489,7 @@ def _is_chatbridge_copilot_payload(payload: dict[str, Any]) -> bool:
 def _guard_copilot_write_when_vscode_running(home: Path, storage: Path, *, force: bool) -> None:
     if force or not _is_live_copilot_storage(home, storage) or not _is_vscode_running():
         return
-    raise SystemExit(
+    raise VSCodeRunningError(
         "VS Code is currently running, so Copilot imports cannot be safely applied. "
         "VS Code keeps chat history and Agent Sessions caches in memory and can overwrite "
         "offline ChatBridge changes on reload or quit.\n"
@@ -1420,6 +1509,8 @@ def _vscode_running_warning(home: Path, storage: Path) -> str:
 
 
 def _is_vscode_running() -> bool:
+    if os.name == "nt":
+        return _is_vscode_running_windows()
     try:
         output = subprocess.run(
             ["ps", "-axo", "args"],
@@ -1439,6 +1530,21 @@ def _is_vscode_running() -> bool:
         "/usr/share/code/code",
         "/snap/code/",
     )
+    return any(pattern in output for pattern in patterns)
+
+
+def _is_vscode_running_windows() -> bool:
+    try:
+        output = subprocess.run(
+            ["tasklist", "/FO", "CSV"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return False
+    patterns = ("Code.exe", "Code - Insiders.exe", "VSCodium.exe", "Cursor.exe")
     return any(pattern in output for pattern in patterns)
 
 

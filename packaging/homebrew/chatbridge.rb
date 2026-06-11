@@ -13,8 +13,10 @@ class Chatbridge < Formula
 
   def install
     system "cargo", "build", "--release", "--manifest-path", "rust/chatbridge-tui/Cargo.toml"
-    libexec.install Dir["*"]
+    # Install the built binary first: once `libexec.install Dir["*"]` runs, the
+    # buildpath-relative target/release path no longer exists.
     (libexec/"bin").install "rust/chatbridge-tui/target/release/chatbridge-tui"
+    libexec.install Dir["*"]
     wrapper = buildpath/"chatbridge"
     wrapper.write <<~EOS
       #!/usr/bin/env bash

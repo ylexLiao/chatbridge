@@ -8,7 +8,41 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: Python version coverage (oldest supported, default, newest).
+          - os: ubuntu-latest
+            python-version: "3.10"
+            rust: false
+            npm: false
+            installer-e2e: false
+          - os: ubuntu-latest
+            python-version: "3.12"
+            rust: true
+            npm: true
+            installer-e2e: true
+          - os: ubuntu-latest
+            python-version: "3.14"
+            rust: false
+            npm: false
+            installer-e2e: false
+          # macOS: full suite.
+          - os: macos-14
+            python-version: "3.12"
+            rust: true
+            npm: true
+            installer-e2e: true
+          # Windows: best-effort (Rust tests + build + CLI version smoke are
+          # required; the Python unittest step is continue-on-error for now).
+          - os: windows-latest
+            python-version: "3.12"
+            rust: true
+            npm: false
+            installer-e2e: false
 
     steps:
       - name: Checkout
@@ -17,7 +51,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -25,12 +59,31 @@ jobs:
           node-version: "20"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        if: matrix.rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.96"
+
+      - name: CLI version smoke
+        run: python -m chatbridge --version
 
       - name: Python tests
-        run: python3 -m unittest discover -s tests
+        if: runner.os != 'Windows'
+        run: python -m unittest discover -s tests
+
+      # Windows-only: the Python suite still has POSIX-only fixtures, so this
+      # step is best-effort and must NOT fail CI. Every other Windows step
+      # (Rust tests, build, CLI smoke) is still required to pass.
+      - name: Python tests (Windows, best-effort)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "::warning title=Windows Python tests are best-effort::Failures in this step are informational only and do not fail CI on Windows yet."
+          python -m unittest discover -s tests
 
       - name: Rust tests
+        if: matrix.rust
         shell: bash
         env:
           RUST_BACKTRACE: "1"
@@ -45,14 +98,63 @@ jobs:
           fi
 
       - name: Build TUI
+        if: matrix.rust
         run: cargo build --manifest-path rust/chatbridge-tui/Cargo.toml --release
 
       - name: npm pack dry run
+        if: matrix.npm
         run: npm pack --dry-run
 
       - name: npm install from package tarball
+        if: matrix.npm
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/chatbridge-pack"
-          TARBALL="$(npm pack --pack-destination "$RUNNER_TEMP/chatbridge-pack" | tail -n 1)"
+          TARBALL="$(npm pack --pack-destination "$RUNNER_TEMP/chatbridge-pack" --json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8"))[0].filename')"
           npm_config_prefix="$RUNNER_TEMP/npm-global" npm install -g "$RUNNER_TEMP/chatbridge-pack/$TARBALL"
           "$RUNNER_TEMP/npm-global/bin/chatbridge" --help
+
+      - name: Installer end-to-end (local release tarball)
+        if: matrix.installer-e2e
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Build a release-layout tarball from this checkout (python package +
+          # freshly built TUI), matching what release.yml publishes.
+          case "$(uname -s)" in
+            Darwin) asset_os=macos ;;
+            *) asset_os=linux ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) asset_arch=arm64 ;;
+            *) asset_arch=x64 ;;
+          esac
+          asset="chatbridge-${asset_os}-${asset_arch}.tar.gz"
+
+          stage="$RUNNER_TEMP/release-stage"
+          assets="$RUNNER_TEMP/release-assets"
+          rm -rf "$stage" "$assets"
+          mkdir -p "$stage/chatbridge/bin" "$assets"
+          cp -R chatbridge "$stage/chatbridge/"
+          cp -R docs "$stage/chatbridge/"
+          cp README.md README.zh-CN.md LICENSE "$stage/chatbridge/"
+          cp rust/chatbridge-tui/target/release/chatbridge-tui "$stage/chatbridge/bin/"
+          tar -C "$stage" -czf "$assets/$asset" chatbridge
+
+          prefix="$RUNNER_TEMP/chatbridge-e2e-prefix"
+          install_dir="$RUNNER_TEMP/chatbridge-e2e-install"
+          rm -rf "$prefix" "$install_dir"
+
+          # Install from the local tarball via the file:// release base.
+          CHATBRIDGE_RELEASE_BASE="file://$assets" bash install.sh --prefix "$prefix" --dir "$install_dir"
+          "$prefix/bin/chatbridge" --version
+          CHATBRIDGE_TUI_SMOKE=1 "$prefix/bin/chatbridge"
+
+          # Uninstall and verify cleanup.
+          CHATBRIDGE_RELEASE_BASE="file://$assets" bash install.sh --prefix "$prefix" --dir "$install_dir" --uninstall
+          if [ -e "$prefix/bin/chatbridge" ] || [ -d "$install_dir" ]; then
+            echo "Installer uninstall left files behind." >&2
+            exit 1
+          fi
