@@ -1783,7 +1783,14 @@ fn expand_home(app: &App, value: &str) -> String {
         .strip_prefix("~/")
         .or_else(|| value.strip_prefix("~\\"))
     {
-        return app.home.join(rest).to_string_lossy().to_string();
+        // Push component by component so the result uses the platform separator
+        // (join("a/b") on Windows would give a mixed "C:\\Users\\me\\a/b").
+        let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+        let mut path = app.home.clone();
+        for part in rest.split(separators).filter(|part| !part.is_empty()) {
+            path.push(part);
+        }
+        return path.to_string_lossy().to_string();
     }
     value.to_string()
 }
@@ -4006,7 +4013,7 @@ fn tilde(app: &App, path: &str) -> String {
     let home = app.home.to_string_lossy();
     if !home.is_empty() && path.starts_with(home.as_ref()) {
         let rest = &path[home.len()..];
-        if rest.is_empty() || rest.starts_with(std::path::MAIN_SEPARATOR) {
+        if rest.is_empty() || rest.starts_with(std::path::is_separator) {
             return format!("~{rest}");
         }
     }
@@ -4158,6 +4165,15 @@ mod tests {
             }),
             ..PreviewData::default()
         }
+    }
+
+    /// "/tmp/home" joined with parts, using this platform's separator.
+    fn home_path(parts: &[&str]) -> String {
+        let mut path = PathBuf::from("/tmp/home");
+        for part in parts {
+            path.push(part);
+        }
+        path.to_string_lossy().to_string()
     }
 
     fn sample_bundle() -> BundleRow {
@@ -4915,7 +4931,8 @@ mod tests {
         }
         let _ = handle_key(&mut app, key(KeyCode::Enter));
         assert!(!app.editing_project);
-        assert_eq!(app.project_override.as_deref(), Some("/tmp/home/work/app"));
+        let work_app = home_path(&["work", "app"]);
+        assert_eq!(app.project_override.as_deref(), Some(work_app.as_str()));
 
         let command = handle_key(&mut app, key(KeyCode::Enter));
         match command {
@@ -4935,7 +4952,7 @@ mod tests {
                 assert_eq!(target, Target::Claude);
                 assert!(!apply);
                 assert!(!allow_duplicate);
-                assert_eq!(project.as_deref(), Some("/tmp/home/work/app"));
+                assert_eq!(project.as_deref(), Some(work_app.as_str()));
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -4960,7 +4977,7 @@ mod tests {
                 assert_eq!(
                     request,
                     ImportRequest::Bundle {
-                        path: "/tmp/home/Downloads/b.json".to_string()
+                        path: home_path(&["Downloads", "b.json"])
                     }
                 );
             }
