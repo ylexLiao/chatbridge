@@ -4,11 +4,14 @@ import copy
 import json
 import re
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import toolcalls
 from .models import Artifact, Message, Session
 from .paths import resolve_paths
+from .toolcalls import ToolCall
 from .util import file_uri_to_path, iter_jsonl, project_to_claude_slug, read_json, text_from_any, timestamp_sort_key
 
 
@@ -230,58 +233,45 @@ def count_copilot_sessions(home: Path, project: str | None = None) -> int:
 
 def count_codex_sessions(home: Path, project: str | None = None) -> int:
     root = resolve_paths(home).codex_home
+    if project:
+        return len([session for session in load_codex_sessions(home, metadata_only=True) if session.project_path == project])
+    ids: set[str] = set()
     db_path = root / "state_5.sqlite"
     if db_path.exists():
         try:
             con = sqlite3.connect(db_path, timeout=10)
             table = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='threads'").fetchone()
             if table:
-                columns = {str(row[1]) for row in con.execute("PRAGMA table_info(threads)").fetchall()}
-                if project and "cwd" in columns:
-                    count = con.execute("SELECT COUNT(*) FROM threads WHERE cwd = ?", (project,)).fetchone()[0]
-                else:
-                    count = con.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
-                con.close()
-                return int(count)
+                ids.update(str(row[0]) for row in con.execute("SELECT id FROM threads"))
             con.close()
         except sqlite3.Error:
             pass
-    index_ids = {str(row["id"]) for row in iter_jsonl(root / "session_index.jsonl") if isinstance(row, dict) and row.get("id")}
-    if index_ids and not project:
-        return len(index_ids)
-    sessions_root = root / "sessions"
-    if not sessions_root.exists():
-        return len(index_ids)
-    ids = set(index_ids)
     index = _codex_session_index(root)
-    for path in sessions_root.rglob("*.jsonl"):
-        ids.add(_codex_id_from_path(path, index))
-    if project:
-        return len([session for session in load_codex_sessions(home, metadata_only=True) if session.project_path == project])
+    ids.update(index)
+    ids.update(str(row["session_id"]) for row in iter_jsonl(root / "history.jsonl") if isinstance(row, dict) and row.get("session_id"))
+    sessions_root = root / "sessions"
+    if sessions_root.exists():
+        ids.update(_codex_id_from_path(path, index) for path in sessions_root.rglob("*.jsonl"))
     return len(ids)
 
 
 def count_claude_sessions(home: Path, project: str | None = None) -> int:
     root = resolve_paths(home).claude_home
-    history_ids: set[str] = set()
-    for row in iter_jsonl(root / "history.jsonl"):
-        if not isinstance(row, dict) or not row.get("sessionId"):
-            continue
-        if project and row.get("project") != project:
-            continue
-        history_ids.add(str(row["sessionId"]))
-    if project:
-        project_dir = root / "projects" / project_to_claude_slug(project)
-        if project_dir.exists():
-            for path in project_dir.glob("*.jsonl"):
-                history_ids.add(path.stem)
-        return len(history_ids)
+    history = _claude_history_index(root)
+    session_ids = {
+        sid
+        for sid, meta in history.items()
+        if meta.prompts and (not project or meta.project == project)
+    }
     projects = root / "projects"
+    if project:
+        project_dir = projects / project_to_claude_slug(project)
+        if project_dir.exists():
+            session_ids.update(path.stem for path in project_dir.glob("*.jsonl"))
+        return len(session_ids)
     if projects.exists():
-        for path in projects.rglob("*.jsonl"):
-            if "subagents" not in path.parts:
-                history_ids.add(path.stem)
-    return len(history_ids)
+        session_ids.update(path.stem for path in projects.rglob("*.jsonl") if "subagents" not in path.parts)
+    return len(session_ids)
 
 
 def _copilot_metadata_fast(path: Path, project_path: str | None, workspace_hash: str) -> Session | None:
@@ -612,11 +602,11 @@ def load_codex_session(home: Path, session_id: str) -> Session | None:
     session = Session(
         source="codex",
         session_id=session_id,
-        title=str(meta.get("thread_name") or meta.get("title") or meta.get("preview") or session_id),
+        title=_codex_title(meta, session_id),
         project_path=meta.get("cwd"),
         created_at=meta.get("created_at_ms") or meta.get("created_at"),
         updated_at=meta.get("updated_at_ms") or meta.get("updated_at"),
-        raw_path=Path(str(meta["rollout_path"])) if meta.get("rollout_path") else None,
+        metadata={"transcript": "missing"},
     )
     seen_texts = {message.text for message in session.messages}
     for key in ("first_user_message", "preview"):
@@ -637,7 +627,7 @@ def _codex_session_from_rollout(path: Path, sid: str, meta: dict[str, Any], meta
     session = Session(
         source="codex",
         session_id=sid,
-        title=str(meta.get("thread_name") or meta.get("title") or meta.get("preview") or sid),
+        title=_codex_title(meta, sid),
         project_path=meta.get("cwd"),
         created_at=meta.get("created_at_ms") or meta.get("created_at"),
         updated_at=meta.get("updated_at_ms") or meta.get("updated_at"),
@@ -645,24 +635,276 @@ def _codex_session_from_rollout(path: Path, sid: str, meta: dict[str, Any], meta
     )
     if metadata_only:
         return session
+    rows: list[dict[str, Any]] = []
     for row in iter_jsonl(path):
         if not isinstance(row, dict):
             continue
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else row
-        if not isinstance(payload, dict):
-            continue
-        if row.get("type") == "session_meta":
+        if row.get("type") == "session_meta" and isinstance(payload, dict):
             session.project_path = str(payload.get("cwd") or session.project_path or "") or None
             session.created_at = payload.get("timestamp") or session.created_at
-        elif row.get("type") == "turn_context" and not session.project_path:
+        elif row.get("type") == "turn_context" and isinstance(payload, dict) and not session.project_path:
             session.project_path = str(payload.get("cwd") or "") or None
-        role = payload.get("role") or payload.get("type")
-        text = text_from_any(payload.get("content") or payload.get("text") or payload.get("message"))
-        if role in {"message", "agent_message"}:
-            role = payload.get("role") or "assistant"
-        if text:
-            session.messages.append(Message(role=str(role or "assistant"), text=text, timestamp=row.get("ts") or row.get("timestamp")))
+        rows.append(row)
+    session.messages.extend(codex_rollout_messages(rows))
     return session
+
+
+# Prefixes of text Codex injects into user turns (not typed by the user).
+CODEX_CONTEXT_PREFIXES = (
+    "<environment_context>",
+    "<user_instructions>",
+    "<permissions instructions>",
+    "<skills_instructions>",
+    "<turn_aborted>",
+    "<collaboration_mode>",
+    "<multi_agent",
+    "# AGENTS.md instructions",
+)
+CODEX_IDE_CONTEXT_PREFIX = "# Context from my IDE setup:"
+CODEX_IDE_REQUEST_MARKER = "## My request for Codex:"
+CODEX_SHELL_NAMES = {"shell", "exec_command", "container.exec", "local_shell", "unified_exec"}
+
+
+def codex_rollout_messages(rows: list[dict[str, Any]]) -> list[Message]:
+    """Turn rollout rows into user/assistant/tool messages, in order.
+
+    Codex >= 0.153 ("paginated" history) records every visible item as an
+    ``event_msg``/``item_completed`` row, which is the cleanest source. Older
+    ("legacy") rollouts only carry ``response_item`` rows (plus duplicate
+    ``event_msg`` user/agent messages, which are skipped).
+    """
+    if any(_codex_row_payload(row).get("type") == "item_completed" for row in rows if row.get("type") == "event_msg"):
+        return _codex_messages_from_items(rows)
+    return _codex_messages_from_response_items(rows)
+
+
+def _codex_row_payload(row: dict[str, Any]) -> dict[str, Any]:
+    payload = row.get("payload")
+    return payload if isinstance(payload, dict) else row
+
+
+def _codex_messages_from_items(rows: list[dict[str, Any]]) -> list[Message]:
+    entries: list[Message | ToolCall] = []
+    for row in rows:
+        payload = _codex_row_payload(row)
+        if row.get("type") != "event_msg" or payload.get("type") != "item_completed":
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            continue
+        timestamp = row.get("timestamp")
+        kind = str(item.get("type") or "")
+        if kind == "UserMessage":
+            text = _codex_user_text(_codex_item_text(item.get("content")))
+            if isinstance(text, ToolCall):
+                text.timestamp = timestamp
+                entries.append(text)
+            elif text:
+                entries.append(Message(role="user", text=text, timestamp=timestamp))
+        elif kind == "AgentMessage":
+            text = _codex_item_text(item.get("content")) or str(item.get("text") or "")
+            if text.strip():
+                entries.append(Message(role="assistant", text=text.strip(), timestamp=timestamp))
+        elif kind == "CommandExecution":
+            call = toolcalls.shell_call(item.get("command") or "", name="shell", cwd=item.get("cwd"))
+            call.add_output(item.get("aggregated_output") or item.get("formatted_output") or "\n".join(
+                part for part in (item.get("stdout"), item.get("stderr")) if part
+            ))
+            call.exit_code = item.get("exit_code") if isinstance(item.get("exit_code"), int) else None
+            call.timestamp = timestamp
+            entries.append(call)
+        elif kind == "FileChange":
+            call = toolcalls.file_change_call(item.get("changes"), name="apply_patch")
+            if str(item.get("status") or "").lower() not in {"", "completed"}:
+                call.add_output(str(item.get("stderr") or item.get("status")))
+                call.is_error = True
+            call.timestamp = timestamp
+            entries.append(call)
+        elif kind in {"McpToolCall", "DynamicToolCall"}:
+            server = item.get("server") or item.get("namespace")
+            name = ".".join(str(part) for part in (server, item.get("tool")) if part) or kind
+            call = toolcalls.generic_call(name, item.get("arguments"))
+            result = item.get("result") if item.get("result") is not None else item.get("content_items")
+            call.add_output(toolcalls.output_text(result if result is not None else item.get("error")))
+            call.is_error = bool(item.get("error"))
+            call.timestamp = timestamp
+            entries.append(call)
+        elif kind == "WebSearch":
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            query = item.get("query") or action.get("query") or action.get("url") or ""
+            entries.append(toolcalls.ToolCall(name="web_search", title=str(query), timestamp=timestamp))
+        elif kind == "ImageView":
+            path = file_uri_to_path(str(item.get("path") or "")) or ""
+            entries.append(toolcalls.ToolCall(name="view_image", title=path, timestamp=timestamp))
+        elif kind == "ImageGeneration":
+            title = str(item.get("revised_prompt") or item.get("saved_path") or "image")
+            entries.append(toolcalls.ToolCall(name="image_generation", title=title, timestamp=timestamp))
+        elif kind == "Plan":
+            entries.append(toolcalls.ToolCall(name="plan", title="plan", body=str(item.get("text") or ""), timestamp=timestamp))
+        elif kind in {"CollabAgentToolCall", "SubAgentActivity"}:
+            label = item.get("tool") or item.get("kind") or "agent"
+            prompt = str(item.get("prompt") or item.get("agent_path") or "")
+            entries.append(toolcalls.ToolCall(name="subagent", title=str(label), body=prompt, body_limit=2000, timestamp=timestamp))
+        elif kind in {"Reasoning", "ContextCompaction", "HookPrompt", "Sleep", "EnteredReviewMode", "ExitedReviewMode", "FunctionCallOutput"}:
+            continue
+        elif kind:
+            call = toolcalls.generic_call(kind, {key: value for key, value in item.items() if key not in {"type", "id"}})
+            call.timestamp = timestamp
+            entries.append(call)
+    return _finalize_entries(entries)
+
+
+def _codex_messages_from_response_items(rows: list[dict[str, Any]]) -> list[Message]:
+    entries: list[Message | ToolCall] = []
+    calls: dict[str, ToolCall] = {}
+    last_shell: ToolCall | None = None
+    for row in rows:
+        if row.get("type") in {"event_msg", "session_meta", "turn_context", "compacted", "world_state", "token_usage_record"}:
+            continue
+        payload = _codex_row_payload(row)
+        timestamp = row.get("timestamp") or row.get("ts")
+        kind = payload.get("type")
+        if kind == "message" or (kind is None and payload.get("role")):
+            role = str(payload.get("role") or "assistant")
+            text = text_from_any(payload.get("content") or payload.get("text") or payload.get("message")).strip()
+            if not text or role in {"developer", "system"}:
+                continue
+            if role == "user":
+                converted = _codex_user_text(text)
+                if isinstance(converted, ToolCall):
+                    converted.timestamp = timestamp
+                    entries.append(converted)
+                elif converted:
+                    entries.append(Message(role="user", text=converted, timestamp=timestamp))
+            else:
+                entries.append(Message(role="assistant", text=text, timestamp=timestamp))
+            continue
+        if kind in {"function_call", "custom_tool_call"}:
+            name = str(payload.get("name") or "tool")
+            raw_args = payload.get("arguments") if kind == "function_call" else payload.get("input")
+            args = _json_or_value(raw_args)
+            if name == "write_stdin":
+                chars = str(args.get("chars") or "") if isinstance(args, dict) else ""
+                if not chars and last_shell is not None:
+                    call = last_shell  # polling a running command: output belongs to it
+                else:
+                    call = toolcalls.ToolCall(name=name, title=f"send input {chars!r}")
+                    entries.append(call)
+            elif name in CODEX_SHELL_NAMES:
+                command = args.get("cmd") or args.get("command") if isinstance(args, dict) else args
+                cwd = args.get("workdir") if isinstance(args, dict) else None
+                call = toolcalls.shell_call(command or "", name="shell", cwd=cwd)
+                last_shell = call
+                entries.append(call)
+            elif name == "apply_patch":
+                patch = args.get("input") or args.get("patch") if isinstance(args, dict) else raw_args
+                call = toolcalls.patch_text_call(str(patch or ""))
+                entries.append(call)
+            elif name == "update_plan" and isinstance(args, dict):
+                call = toolcalls.plan_call(args.get("plan"), args.get("explanation"))
+                entries.append(call)
+            else:
+                call = toolcalls.generic_call(name, args)
+                entries.append(call)
+            call.timestamp = call.timestamp or timestamp
+            call_id = payload.get("call_id")
+            if call_id:
+                calls[str(call_id)] = call
+            continue
+        if kind in {"function_call_output", "custom_tool_call_output"}:
+            call = calls.get(str(payload.get("call_id") or ""))
+            if call is None:
+                continue
+            raw = payload.get("output")
+            exit_code = toolcalls.output_exit_code(raw)
+            if exit_code is not None:
+                call.exit_code = exit_code
+            call.add_output(toolcalls.strip_exec_preamble(toolcalls.output_text(raw)))
+            continue
+        if kind == "local_shell_call":
+            action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+            call = toolcalls.shell_call(action.get("command") or "", name="shell", cwd=action.get("working_directory"))
+            call.timestamp = timestamp
+            last_shell = call
+            entries.append(call)
+            if payload.get("call_id"):
+                calls[str(payload["call_id"])] = call
+            continue
+        if kind == "web_search_call":
+            action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+            query = action.get("query") or action.get("url") or ""
+            entries.append(toolcalls.ToolCall(name="web_search", title=str(query), timestamp=timestamp))
+    return _finalize_entries(entries)
+
+
+def _codex_item_text(content: Any) -> str:
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "").lower() in {"text", "input_text", "output_text"}:
+                parts.append(str(part.get("text") or ""))
+            elif isinstance(part, dict) and str(part.get("type") or "").lower() in {"image", "local_image", "input_image"}:
+                parts.append(text_from_any({"type": "image", **part}))
+        return "\n".join(part for part in parts if part).strip()
+    return text_from_any(content).strip()
+
+
+def _codex_user_text(text: str) -> str | ToolCall:
+    """Strip Codex-injected context from a user turn; '' means the turn was pure context."""
+    clean = text.strip()
+    if not clean or clean.startswith(CODEX_CONTEXT_PREFIXES):
+        return ""
+    if clean.startswith(CODEX_IDE_CONTEXT_PREFIX):
+        _, marker, request = clean.partition(CODEX_IDE_REQUEST_MARKER)
+        return request.strip() if marker else ""
+    if clean.startswith("<user_shell_command>"):
+        command = _between(clean, "<command>", "</command>")
+        result = _between(clean, "<result>", "</result>")
+        call = toolcalls.shell_call(command, name="user_shell")
+        call.exit_code = toolcalls.output_exit_code(result.replace("Exit code:", "Process exited with code", 1))
+        call.add_output(toolcalls.strip_exec_preamble(result.strip()))
+        return call
+    return clean
+
+
+def _between(text: str, start: str, end: str) -> str:
+    _, found, rest = text.partition(start)
+    if not found:
+        return ""
+    return rest.partition(end)[0].strip("\n")
+
+
+def _json_or_value(value: Any) -> Any:
+    if isinstance(value, str) and value.strip()[:1] == "{":
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def _finalize_entries(entries: list[Message | ToolCall]) -> list[Message]:
+    """Render tool calls and drop adjacent exact duplicates."""
+    messages: list[Message] = []
+    for entry in entries:
+        if isinstance(entry, ToolCall):
+            message = Message(role="tool", text=entry.render(), timestamp=entry.timestamp, tool=entry.name)
+        else:
+            message = entry
+        if messages and messages[-1].role == message.role and messages[-1].text == message.text:
+            continue
+        messages.append(message)
+    return messages
+
+
+def _codex_title(meta: dict[str, Any], fallback: str) -> str:
+    """Codex's own thread name (auto or renamed) beats the first-message title."""
+    for key in ("name", "thread_name", "title", "preview"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return fallback
 
 
 def _codex_rollout_candidates(root: Path, session_id: str, meta: dict[str, Any]) -> list[Path]:
@@ -696,6 +938,7 @@ def _codex_thread_from_state_db(root: Path, session_id: str) -> dict[str, Any]:
         columns = {str(row[1]) for row in con.execute("PRAGMA table_info(threads)").fetchall()}
         wanted = [
             "id",
+            "name",
             "title",
             "cwd",
             "created_at",
@@ -749,6 +992,7 @@ def _load_codex_metadata_limited(root: Path, index: dict[str, dict[str, Any]], l
         if len(sessions) >= limit:
             return list(sessions.values())
 
+    rollout_ids = _codex_rollout_ids(root, index)
     for row in iter_jsonl(root / "history.jsonl"):
         if not isinstance(row, dict) or not row.get("session_id"):
             continue
@@ -760,6 +1004,7 @@ def _load_codex_metadata_limited(root: Path, index: dict[str, dict[str, Any]], l
             session_id=sid,
             title=str(index.get(sid, {}).get("thread_name") or text_from_any(row.get("text")) or sid),
             updated_at=index.get(sid, {}).get("updated_at") or row.get("ts"),
+            metadata={} if sid in rollout_ids else {"transcript": "missing"},
         )
         if len(sessions) >= limit:
             return list(sessions.values())
@@ -801,7 +1046,7 @@ def _codex_metadata_from_state_db(root: Path, limit: int) -> list[Session]:
             con.close()
             return []
         columns = {str(row[1]) for row in con.execute("PRAGMA table_info(threads)").fetchall()}
-        wanted = ["id", "title", "cwd", "created_at", "updated_at", "created_at_ms", "updated_at_ms", "rollout_path", "preview"]
+        wanted = ["id", "name", "title", "cwd", "created_at", "updated_at", "created_at_ms", "updated_at_ms", "rollout_path", "preview"]
         selected = [column for column in wanted if column in columns]
         if "id" not in selected:
             con.close()
@@ -824,7 +1069,7 @@ def _codex_metadata_from_state_db(root: Path, limit: int) -> list[Session]:
             Session(
                 source="codex",
                 session_id=sid,
-                title=str(item.get("title") or item.get("preview") or sid),
+                title=str(item.get("name") or item.get("title") or item.get("preview") or sid),
                 project_path=item.get("cwd"),
                 created_at=item.get("created_at_ms") or item.get("created_at"),
                 updated_at=item.get("updated_at_ms") or item.get("updated_at"),
@@ -832,6 +1077,15 @@ def _codex_metadata_from_state_db(root: Path, limit: int) -> list[Session]:
             )
         )
     return sessions
+
+
+def _codex_rollout_ids(root: Path, index: dict[str, dict[str, Any]]) -> set[str]:
+    sessions_root = root / "sessions"
+    ids: set[str] = set()
+    for folder in (sessions_root, root / "archived_sessions"):
+        if folder.exists():
+            ids.update(_codex_id_from_path(path, index) for path in folder.rglob("*.jsonl"))
+    return ids
 
 
 def _codex_id_from_path(path: Path, index: dict[str, dict[str, Any]]) -> str:
@@ -850,10 +1104,7 @@ def _codex_id_from_path(path: Path, index: dict[str, dict[str, Any]]) -> str:
 
 def load_claude_sessions(home: Path, metadata_only: bool = False, limit: int | None = None) -> list[Session]:
     root = resolve_paths(home).claude_home
-    history: dict[str, dict[str, Any]] = {}
-    for row in iter_jsonl(root / "history.jsonl"):
-        if isinstance(row, dict) and row.get("sessionId"):
-            history[str(row["sessionId"])] = row
+    history = _claude_history_index(root)
     if metadata_only and limit:
         return _load_claude_metadata_limited(root, history, limit)
 
@@ -864,79 +1115,250 @@ def load_claude_sessions(home: Path, metadata_only: bool = False, limit: int | N
             if "subagents" in path.parts:
                 continue
             sid = path.stem
-            meta = history.get(sid, {})
-            project = meta.get("project")
+            meta = history.get(sid)
             session = Session(
                 source="claude",
                 session_id=sid,
-                title=str(meta.get("display") or sid),
-                project_path=project,
-                updated_at=meta.get("timestamp"),
+                title=(meta.title if meta else "") or sid,
+                project_path=meta.project if meta else None,
+                created_at=meta.created_at if meta else None,
+                updated_at=meta.updated_at if meta else None,
                 raw_path=path,
             )
-            if not metadata_only:
-                for row in iter_jsonl(path):
-                    if not isinstance(row, dict):
-                        continue
-                    if not session.project_path and row.get("cwd"):
-                        session.project_path = str(row["cwd"])
-                    role = row.get("type") or row.get("role") or "assistant"
-                    text = text_from_any(row.get("message") or row.get("content") or row.get("text"))
-                    if text:
-                        session.messages.append(Message(role=str(role), text=text, timestamp=row.get("timestamp")))
+            if metadata_only:
+                titles = _claude_tail_titles(path)
+                session.title = titles.get("custom") or titles.get("ai") or session.title
+            else:
+                _fill_claude_session(session, path, meta)
             sessions[sid] = session
-    seen_texts: dict[str, set[str]] = {}
-    for sid, row in history.items():
-        session = sessions.setdefault(
-            sid,
-            Session(source="claude", session_id=sid, title=str(row.get("display") or sid), project_path=row.get("project"), updated_at=row.get("timestamp")),
-        )
-        text = text_from_any(row.get("display"))
-        if not text:
+    for sid, meta in history.items():
+        if sid in sessions or not meta.prompts:
             continue
-        seen = seen_texts.get(sid)
-        if seen is None:
-            seen = {message.text for message in session.messages}
-            seen_texts[sid] = seen
-        if text not in seen:
-            seen.add(text)
-            session.messages.append(Message(role="user", text=text, timestamp=row.get("timestamp")))
+        sessions[sid] = Session(
+            source="claude",
+            session_id=sid,
+            title=meta.title or sid,
+            project_path=meta.project,
+            updated_at=meta.updated_at,
+            messages=[] if metadata_only else [Message(role="user", text=prompt, timestamp=ts) for prompt, ts in meta.prompts],
+            metadata={"transcript": "missing"},
+        )
     return list(sessions.values())
 
 
 def load_claude_session(home: Path, session_id: str) -> Session | None:
     root = resolve_paths(home).claude_home
-    history = {
-        str(row["sessionId"]): row
-        for row in iter_jsonl(root / "history.jsonl")
-        if isinstance(row, dict) and row.get("sessionId")
-    }
-    meta = history.get(session_id, {})
+    meta = _claude_history_index(root).get(session_id)
     path = _find_claude_project_file(root, session_id)
     if not path and not meta:
         return None
     session = Session(
         source="claude",
         session_id=session_id,
-        title=str(meta.get("display") or session_id),
-        project_path=meta.get("project"),
-        updated_at=meta.get("timestamp"),
+        title=(meta.title if meta else "") or session_id,
+        project_path=meta.project if meta else None,
+        created_at=meta.created_at if meta else None,
+        updated_at=meta.updated_at if meta else None,
         raw_path=path,
     )
     if path:
-        for row in iter_jsonl(path):
-            if not isinstance(row, dict):
-                continue
-            if not session.project_path and row.get("cwd"):
-                session.project_path = str(row["cwd"])
-            role = row.get("type") or row.get("role") or "assistant"
-            text = text_from_any(row.get("message") or row.get("content") or row.get("text"))
-            if text:
-                session.messages.append(Message(role=str(role), text=text, timestamp=row.get("timestamp")))
-    text = text_from_any(meta.get("display"))
-    if text and not any(message.text == text for message in session.messages):
-        session.messages.append(Message(role="user", text=text, timestamp=meta.get("timestamp")))
+        _fill_claude_session(session, path, meta)
+    elif meta:
+        session.messages = [Message(role="user", text=prompt, timestamp=ts) for prompt, ts in meta.prompts]
+        session.metadata = {"transcript": "missing"}
     return session
+
+
+@dataclass
+class _ClaudeHistory:
+    project: str | None = None
+    created_at: Any = None
+    updated_at: Any = None
+    title: str = ""
+    prompts: list[tuple[str, Any]] = field(default_factory=list)
+
+
+def _claude_history_index(root: Path) -> dict[str, _ClaudeHistory]:
+    """sessionId -> project, last activity and the first real prompt (never a /command)."""
+    index: dict[str, _ClaudeHistory] = {}
+    for row in iter_jsonl(root / "history.jsonl"):
+        if not isinstance(row, dict) or not row.get("sessionId"):
+            continue
+        meta = index.setdefault(str(row["sessionId"]), _ClaudeHistory())
+        meta.project = row.get("project") or meta.project
+        meta.created_at = meta.created_at or row.get("timestamp")
+        meta.updated_at = row.get("timestamp") or meta.updated_at
+        prompt = text_from_any(row.get("display")).strip()
+        if _is_meaningful_prompt(prompt):
+            meta.prompts.append((prompt, row.get("timestamp")))
+            if not meta.title:
+                meta.title = _title_from_prompt(prompt)
+    return index
+
+
+def _is_meaningful_prompt(text: str) -> bool:
+    return bool(text) and not _looks_like_slash_command(text) and not text.startswith(CLAUDE_NOISE_PREFIXES)
+
+
+def _looks_like_slash_command(text: str) -> bool:
+    """"/compact keep it short" is a command; "/home/me/app 这是什么" is a prompt about a path."""
+    first = text.split(maxsplit=1)[0] if text.strip() else ""
+    return first.startswith("/") and len(first) > 1 and "/" not in first[1:]
+
+
+def _title_from_prompt(text: str, limit: int = 120) -> str:
+    line = " ".join(text.split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def _fill_claude_session(session: Session, path: Path, meta: _ClaudeHistory | None) -> None:
+    messages, titles, cwd = claude_transcript_messages(iter_jsonl(path))
+    session.messages = messages
+    if not session.project_path and cwd:
+        session.project_path = cwd
+    first_prompt = next((m.text for m in messages if m.role == "user" and _is_meaningful_prompt(m.text)), "")
+    session.title = (
+        titles.get("custom")
+        or titles.get("ai")
+        or titles.get("summary")
+        or (meta.title if meta else "")
+        or (_title_from_prompt(first_prompt) if first_prompt else "")
+        or session.session_id
+    )
+    if not session.created_at and messages:
+        session.created_at = messages[0].timestamp
+
+
+# User-turn text Claude Code generates itself (slash commands, local command output, notices).
+CLAUDE_NOISE_PREFIXES = (
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "<system-reminder>",
+    "Caveat: The messages below were generated by the user while running local commands",
+)
+
+
+def claude_transcript_messages(rows: Any) -> tuple[list[Message], dict[str, str], str | None]:
+    """Parse Claude Code transcript rows into messages, title candidates and cwd."""
+    entries: list[Message | ToolCall] = []
+    pending: dict[str, ToolCall] = {}
+    titles: dict[str, str] = {}
+    cwd: str | None = None
+    last_text_message_id: str | None = None
+    last_user_shell: ToolCall | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        kind = row.get("type")
+        if kind == "custom-title" and row.get("customTitle"):
+            titles["custom"] = str(row["customTitle"])
+        elif kind == "ai-title" and row.get("aiTitle"):
+            titles["ai"] = str(row["aiTitle"])
+        elif kind == "summary" and row.get("summary"):
+            titles.setdefault("summary", str(row["summary"]))
+        if kind not in {"user", "assistant"}:
+            continue
+        if row.get("isSidechain") or row.get("isMeta") or row.get("isCompactSummary") or row.get("isApiErrorMessage"):
+            continue
+        if not cwd and row.get("cwd"):
+            cwd = str(row["cwd"])
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else message if message is not None else row.get("content")
+        timestamp = row.get("timestamp")
+        if kind == "user":
+            last_text_message_id = None
+            if isinstance(content, list):
+                texts: list[str] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if block_type == "text":
+                        texts.append(str(block.get("text") or ""))
+                    elif block_type == "tool_result":
+                        call = pending.get(str(block.get("tool_use_id") or ""))
+                        if call is not None:
+                            call.add_output(toolcalls.output_text(block.get("content")))
+                            call.is_error = bool(block.get("is_error"))
+                    elif block_type in {"image", "document"}:
+                        texts.append(text_from_any({"type": "image", **block}) if block_type == "image" else "[Document attachment not imported]")
+                text = "\n".join(part for part in texts if part.strip())
+            else:
+                text = text_from_any(content)
+            text = text.strip()
+            if text.startswith("<bash-input>"):
+                last_user_shell = toolcalls.shell_call(_between(text, "<bash-input>", "</bash-input>"), name="user_shell")
+                last_user_shell.timestamp = timestamp
+                entries.append(last_user_shell)
+            elif text.startswith("<bash-stdout>") or text.startswith("<bash-stderr>"):
+                if last_user_shell is not None:
+                    last_user_shell.add_output(_between(text, "<bash-stdout>", "</bash-stdout>"))
+                    last_user_shell.add_output(_between(text, "<bash-stderr>", "</bash-stderr>"))
+            elif _is_meaningful_prompt(text):
+                entries.append(Message(role="user", text=text, timestamp=timestamp))
+            continue
+
+        message_id = str(message.get("id") or "") if isinstance(message, dict) else ""
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": text_from_any(content)}]
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "text":
+                text = str(block.get("text") or "").strip()
+                if not text:
+                    continue
+                previous = entries[-1] if entries else None
+                if (
+                    message_id
+                    and message_id == last_text_message_id
+                    and isinstance(previous, Message)
+                    and previous.role == "assistant"
+                ):
+                    previous.text = f"{previous.text}\n\n{text}"
+                else:
+                    entries.append(Message(role="assistant", text=text, timestamp=timestamp))
+                last_text_message_id = message_id
+            elif block_type in {"tool_use", "server_tool_use"}:
+                call = toolcalls.claude_tool_call(str(block.get("name") or "tool"), block.get("input"))
+                call.timestamp = timestamp
+                entries.append(call)
+                if block.get("id"):
+                    pending[str(block["id"])] = call
+                last_text_message_id = None
+    return _finalize_entries(entries), titles, cwd
+
+
+def _claude_tail_titles(path: Path, max_bytes: int = 262144) -> dict[str, str]:
+    """Latest custom/AI title rows near the end of a transcript, without reading it all."""
+    titles: dict[str, str] = {}
+    try:
+        with path.open("rb") as handle:
+            size = handle.seek(0, 2)
+            handle.seek(max(0, size - max_bytes))
+            chunk = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return titles
+    lines = chunk.splitlines()
+    if len(chunk) >= max_bytes and lines:
+        lines = lines[1:]  # first line is probably cut in half
+    for line in lines:
+        if '"custom-title"' not in line and '"ai-title"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("type") == "custom-title" and row.get("customTitle"):
+            titles["custom"] = str(row["customTitle"])
+        elif row.get("type") == "ai-title" and row.get("aiTitle"):
+            titles["ai"] = str(row["aiTitle"])
+    return titles
 
 
 def _find_claude_project_file(root: Path, session_id: str) -> Path | None:
@@ -949,15 +1371,30 @@ def _find_claude_project_file(root: Path, session_id: str) -> Path | None:
     return None
 
 
-def _load_claude_metadata_limited(root: Path, history: dict[str, dict[str, Any]], limit: int) -> list[Session]:
+def _claude_transcript_path(root: Path, session_id: str, project: str | None) -> Path | None:
+    if project:
+        candidate = root / "projects" / project_to_claude_slug(project) / f"{session_id}.jsonl"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_claude_metadata_limited(root: Path, history: dict[str, _ClaudeHistory], limit: int) -> list[Session]:
     sessions: dict[str, Session] = {}
-    for sid, row in sorted(history.items(), key=lambda item: timestamp_sort_key(item[1].get("timestamp")), reverse=True):
+    for sid, meta in sorted(history.items(), key=lambda item: timestamp_sort_key(item[1].updated_at), reverse=True):
+        path = _claude_transcript_path(root, sid, meta.project)
+        if path is None and not meta.prompts:
+            continue  # e.g. a session where only "/resume" was typed: nothing to import
+        titles = _claude_tail_titles(path) if path else {}
         sessions[sid] = Session(
             source="claude",
             session_id=sid,
-            title=str(row.get("display") or sid),
-            project_path=row.get("project"),
-            updated_at=row.get("timestamp"),
+            title=titles.get("custom") or titles.get("ai") or meta.title or sid,
+            project_path=meta.project,
+            created_at=meta.created_at,
+            updated_at=meta.updated_at,
+            raw_path=path,
+            metadata={} if path else {"transcript": "missing"},
         )
         if len(sessions) >= limit:
             return list(sessions.values())
@@ -976,13 +1413,15 @@ def _load_claude_metadata_limited(root: Path, history: dict[str, dict[str, Any]]
         sid = path.stem
         if sid in sessions:
             continue
-        meta = history.get(sid, {})
+        meta = history.get(sid)
+        titles = _claude_tail_titles(path)
         sessions[sid] = Session(
             source="claude",
             session_id=sid,
-            title=str(meta.get("display") or sid),
-            project_path=meta.get("project"),
-            updated_at=meta.get("timestamp") or int(mtime * 1000),
+            title=titles.get("custom") or titles.get("ai") or (meta.title if meta else "") or sid,
+            project_path=meta.project if meta else None,
+            created_at=meta.created_at if meta else None,
+            updated_at=(meta.updated_at if meta else None) or int(mtime * 1000),
             raw_path=path,
         )
         if len(sessions) >= limit:

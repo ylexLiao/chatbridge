@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
 
+from .codex_config import DEFAULT_PROVIDER, read_codex_settings
 from .models import Session
 from .paths import resolve_paths
 from .summary import build_handoff
-from .util import append_jsonl, backup_paths, iter_jsonl, now_iso, parse_timestamp, project_to_claude_slug, read_json, redact, sanitize_embedded_images, text_from_any, write_jsonl
+from .toolcalls import clip
+from .util import append_jsonl, approx_tokens, backup_paths, iter_jsonl, now_iso, parse_timestamp, project_to_claude_slug, read_json, redact, sanitize_embedded_images, text_from_any, write_jsonl
 
 IMPORT_MARKER = "Imported by ChatBridge. Treat this as context, not verified fact."
 LEGACY_IMPORT_MARKER = "Imported by ChatNBridge. Treat this as context, not verified fact."
@@ -64,16 +66,20 @@ def native_import(
     level: str = "normal",
     allow_duplicate: bool = False,
     force_running_vscode: bool = False,
+    max_tokens: int | None = None,
 ) -> str:
     handoff = build_handoff(session, target, level=level)
     base_title = f"[Imported from {session.source_label}] {session.title}"
     title = base_title
     project_path = _native_import_target_project(session, target, home, project)
+    budget = LEVEL_TOKEN_BUDGETS.get(level, LEVEL_TOKEN_BUDGETS["normal"]) if max_tokens is None else max_tokens
+    projection = project_transcript(session, budget or None)
     if not apply:
-        mode = "structured transcript" if _project_session_messages(session) else "handoff fallback"
+        mode = "structured transcript" if projection.messages else "handoff fallback"
         return (
             f"DRY RUN: would import {session.source_label} session {session.session_id} into {target} using {mode}.\n"
-            f"Target project: {project_path}\n\n{handoff}"
+            f"Target project: {project_path}\n"
+            f"{projection.summary(len(session.messages))}\n\n{handoff}"
         )
     existing_titles = _native_import_existing_titles(target, home, project_path, base_title)
     if existing_titles:
@@ -86,22 +92,22 @@ def native_import(
             )
         title = next_title
     if target == "codex":
-        return _insert_target_project_line(_write_codex(session, home, title, handoff, project_path), project_path)
-    if target == "claude":
-        return _insert_target_project_line(_write_claude(session, home, title, handoff, project_path), project_path)
-    if target == "copilot":
-        return _insert_target_project_line(
-            _write_copilot(session, home, title, handoff, project_path, force_running_vscode=force_running_vscode),
-            project_path,
-        )
-    raise SystemExit(f"Unsupported native import target: {target}")
+        result = _write_codex(session, home, title, handoff, project_path, projection.messages)
+    elif target == "claude":
+        result = _write_claude(session, home, title, handoff, project_path, projection.messages)
+    elif target == "copilot":
+        result = _write_copilot(session, home, title, handoff, project_path, projection.messages, force_running_vscode=force_running_vscode)
+    else:
+        raise SystemExit(f"Unsupported native import target: {target}")
+    return _insert_target_project_line(result, project_path, projection.summary(len(session.messages)))
 
 
-def _insert_target_project_line(text: str, project_path: str) -> str:
+def _insert_target_project_line(text: str, project_path: str, transcript_line: str = "") -> str:
+    extra = f"{transcript_line}\n" if transcript_line else ""
     head, sep, tail = text.partition("\n")
     if not sep:
-        return f"{text}\nTarget project: {project_path}\n"
-    return f"{head}{sep}Target project: {project_path}\n{tail}"
+        return f"{text}\nTarget project: {project_path}\n{extra}"
+    return f"{head}{sep}Target project: {project_path}\n{extra}{tail}"
 
 
 def _native_import_target_project(session: Session, target: str, home: Path, project: str | None) -> str:
@@ -299,16 +305,16 @@ def repair_codex_imports(home: Path, apply: bool) -> str:
     db_path = root / "state_5.sqlite"
     if not db_path.exists():
         return "No Codex state database found.\n"
-    rows = _find_codex_imports_to_repair(root)
+    defaults = _codex_native_defaults(root)
+    rows = _find_codex_imports_to_repair(root, defaults)
     if not rows:
         return "No Codex imports need repair.\n"
-    lines = [f"{row['id']} | {row['desired_title']} | {row['cwd']}" for row in rows]
+    lines = [f"{row['id']} | {row['desired_title']} | {row['cwd']} | provider {row.get('model_provider')} -> {defaults['model_provider']}" for row in rows]
     if not apply:
         return "DRY RUN: would repair Codex imported sessions:\n" + "\n".join(lines) + "\n"
 
     rollout_paths = [Path(str(row["rollout_path"])) for row in rows if row["rollout_path"]]
     backup = backup_paths(home, [db_path, root / "state_5.sqlite-wal", root / "state_5.sqlite-shm", *rollout_paths])
-    defaults = _codex_native_defaults(root)
     now = int(time.time())
     now_ms = now * 1000
     con = sqlite3.connect(db_path, timeout=10)
@@ -456,9 +462,71 @@ def _write_claude_repaired_rows(target: Path, sid: str, title: str, project_path
     write_jsonl(target, rows)
 
 
+# Approximate token budget for an imported transcript, by --level (0 = unlimited).
+LEVEL_TOKEN_BUDGETS = {"brief": 20_000, "normal": 60_000, "full": 120_000}
+OLD_TOOL_CLIP = 600
+OLD_MESSAGE_CLIP = 1500
+RECENT_TOOLS_KEPT = 5
+RECENT_MESSAGES_KEPT = 4
+
+
+@dataclass
+class TranscriptProjection:
+    messages: list[ProjectedMessage]
+    approx_tokens: int
+    budget: int | None
+    notes: list[str]
+
+    def summary(self, source_count: int) -> str:
+        budget = f"budget ~{_format_tokens(self.budget)}" if self.budget else "no token budget"
+        line = f"Transcript: {source_count} source messages -> {len(self.messages)} imported messages, ~{_format_tokens(self.approx_tokens)} tokens ({budget})."
+        if self.notes:
+            line += "\nTrimmed to fit: " + "; ".join(self.notes) + ". Use --max-tokens 0 to import everything."
+        return line
+
+
+def _format_tokens(value: int | None) -> str:
+    if not value:
+        return "0"
+    return f"{value / 1000:.1f}K" if value >= 1000 else str(value)
+
+
+@dataclass
+class _ProjectionItem:
+    role: str  # "user" | "assistant" | "tool"
+    text: str
+    timestamp: Any = None
+    # "artifact" items (recovered Copilot tool results) render as user turns but
+    # are trimmed like tool output, before any conversation text.
+    kind: str = "message"
+
+    @property
+    def is_tool_like(self) -> bool:
+        return self.role == "tool" or self.kind == "artifact"
+
+
+def project_transcript(session: Session, max_tokens: int | None = None) -> TranscriptProjection:
+    """Session messages as the user/assistant turns a target tool can store.
+
+    Tool calls become fenced blocks inside assistant turns. With a budget,
+    older material is trimmed first (tool output, then whole tool calls, then
+    long messages, then the oldest messages) so the import stays resumable.
+    """
+    items = _projection_items(session)
+    notes: list[str] = []
+    if max_tokens:
+        items, notes = _fit_token_budget(items, max_tokens)
+    messages = _render_projection(items)
+    total = sum(approx_tokens(message.text) for message in messages)
+    return TranscriptProjection(messages=messages, approx_tokens=total, budget=max_tokens, notes=notes)
+
+
 def _project_session_messages(session: Session) -> list[ProjectedMessage]:
-    projected: list[ProjectedMessage] = []
-    seen: set[tuple[str, str]] = set()
+    return project_transcript(session).messages
+
+
+def _projection_items(session: Session) -> list[_ProjectionItem]:
+    items: list[_ProjectionItem] = []
     for message in session.messages:
         role = _project_role(message.role)
         if role is None:
@@ -466,12 +534,11 @@ def _project_session_messages(session: Session) -> list[ProjectedMessage]:
         text = sanitize_embedded_images(redact(str(message.text or ""))).strip()
         if not text:
             continue
-        key = (role, text)
-        if key in seen:
-            continue
-        seen.add(key)
-        projected.append(ProjectedMessage(role=role, text=text, timestamp=message.timestamp))
+        if items and items[-1].role == role and items[-1].text == text:
+            continue  # only adjacent repeats: "继续" twice in a session is two turns
+        items.append(_ProjectionItem(role=role, text=text, timestamp=message.timestamp))
 
+    seen_artifacts: set[str] = set()
     for artifact in session.artifacts:
         text = sanitize_embedded_images(redact(str(artifact.text or ""))).strip()
         if not text:
@@ -480,12 +547,130 @@ def _project_session_messages(session: Session) -> list[ProjectedMessage]:
         if artifact.path:
             label = f"{label} ({artifact.path})"
         artifact_text = f"[Recovered artifact: {label}]\n{text}"
-        key = ("user", artifact_text)
-        if key in seen:
+        if artifact_text in seen_artifacts:
             continue
-        seen.add(key)
-        projected.append(ProjectedMessage(role="user", text=artifact_text, timestamp=session.updated_at))
-    return projected
+        seen_artifacts.add(artifact_text)
+        items.append(_ProjectionItem(role="user", text=artifact_text, timestamp=session.updated_at, kind="artifact"))
+    return items
+
+
+def _fit_token_budget(items: list[_ProjectionItem], budget: int) -> tuple[list[_ProjectionItem], list[str]]:
+    """Trim the transcript to ~budget tokens, cheapest losses first, deterministically.
+
+    Order: older tool output -> older tool calls -> older long messages ->
+    the newest tool calls -> oldest messages (the first prompt and the final
+    message always stay). Conversation text outlives tool output.
+    """
+    items = list(items)
+    sizes = [approx_tokens(item.text) for item in items]
+    total = sum(sizes)
+    notes: list[str] = []
+    if total <= budget:
+        return items, notes
+    tool_indices = [index for index, item in enumerate(items) if item.is_tool_like]
+    message_indices = [index for index, item in enumerate(items) if not item.is_tool_like]
+    recent_tools = set(tool_indices[-RECENT_TOOLS_KEPT:])
+    recent_messages = set(message_indices[-RECENT_MESSAGES_KEPT:])
+    old_tools = [index for index in tool_indices if index not in recent_tools]
+    old_messages = [index for index in message_indices if index not in recent_messages]
+    dropped: set[int] = set()
+    counts = {"tool_clipped": 0, "tool_dropped": 0, "message_clipped": 0, "message_dropped": 0}
+
+    def shrink(index: int, limit: int) -> bool:
+        nonlocal total
+        if len(items[index].text) <= limit:
+            return False
+        text = clip(items[index].text, limit)
+        new_size = approx_tokens(text)
+        total += new_size - sizes[index]
+        sizes[index] = new_size
+        items[index] = _ProjectionItem(items[index].role, text, items[index].timestamp, items[index].kind)
+        return True
+
+    def drop(index: int) -> None:
+        nonlocal total
+        dropped.add(index)
+        total -= sizes[index]
+
+    for group in (old_tools, sorted(recent_tools)):
+        for index in group:
+            if total <= budget:
+                break
+            if shrink(index, OLD_TOOL_CLIP):
+                counts["tool_clipped"] += 1
+        for index in group:
+            if total <= budget:
+                break
+            drop(index)
+            counts["tool_dropped"] += 1
+        if group is old_tools:
+            for index in old_messages:
+                if total <= budget:
+                    break
+                if shrink(index, OLD_MESSAGE_CLIP):
+                    counts["message_clipped"] += 1
+
+    first_user = next((index for index in message_indices if items[index].role == "user"), None)
+    last_index = message_indices[-1] if message_indices else len(items) - 1
+    for index in message_indices:
+        if total <= budget:
+            break
+        if index in (first_user, last_index) or index in dropped:
+            continue
+        drop(index)
+        counts["message_dropped"] += 1
+
+    if counts["tool_clipped"]:
+        notes.append(f"shortened {counts['tool_clipped']} tool outputs")
+    if counts["tool_dropped"]:
+        notes.append(f"left out {counts['tool_dropped']} older tool calls")
+    if counts["message_clipped"]:
+        notes.append(f"shortened {counts['message_clipped']} older long messages")
+    if counts["message_dropped"]:
+        notes.append(f"left out {counts['message_dropped']} older messages")
+
+    kept: list[_ProjectionItem] = []
+    note_added = False
+    omitted = counts["tool_dropped"] + counts["message_dropped"]
+    for index, item in enumerate(items):
+        if index in dropped:
+            if not note_added:
+                kept.append(_ProjectionItem(
+                    role="assistant",
+                    text=f"[ChatBridge: {omitted} earlier messages/tool calls were left out so this import fits the target's context window. The source session has the full history.]",
+                    timestamp=item.timestamp,
+                ))
+                note_added = True
+            continue
+        kept.append(item)
+    return kept, notes
+
+
+def _render_projection(items: list[_ProjectionItem]) -> list[ProjectedMessage]:
+    """Merge runs of tool calls into one assistant turn of fenced blocks."""
+    rendered: list[ProjectedMessage] = []
+    tools: list[_ProjectionItem] = []
+
+    def flush() -> None:
+        if tools:
+            text = "\n\n".join(_fenced(item.text) for item in tools)
+            rendered.append(ProjectedMessage(role="assistant", text=text, timestamp=tools[0].timestamp))
+            tools.clear()
+
+    for item in items:
+        if item.role == "tool":
+            tools.append(item)
+            continue
+        flush()
+        rendered.append(ProjectedMessage(role=item.role, text=item.text, timestamp=item.timestamp))
+    flush()
+    return rendered
+
+
+def _fenced(text: str) -> str:
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
 
 
 def _project_role(role: Any) -> str | None:
@@ -494,6 +679,8 @@ def _project_role(role: Any) -> str | None:
         return "user"
     if clean in {"assistant", "agent", "agent_message", "assistant_message", "response", "message"}:
         return "assistant"
+    if clean in {"tool", "tool_call", "tool_result"}:
+        return "tool"
     return None
 
 
@@ -523,7 +710,7 @@ def _approx_token_count(messages: list[ProjectedMessage]) -> int:
     return max(1, total // 4) if total else 0
 
 
-def _write_codex(session: Session, home: Path, title: str, handoff: str, project_path: str) -> str:
+def _write_codex(session: Session, home: Path, title: str, handoff: str, project_path: str, projected: list[ProjectedMessage] | None = None) -> str:
     root = resolve_paths(home).codex_home
     backup = backup_paths(home, [root / "session_index.jsonl", root / "history.jsonl", root / "state_5.sqlite", root / "state_5.sqlite-wal", root / "state_5.sqlite-shm"])
     defaults = _codex_native_defaults(root)
@@ -534,7 +721,7 @@ def _write_codex(session: Session, home: Path, title: str, handoff: str, project
     prompt = _codex_import_user_prompt(title)
     assistant_context = _codex_import_assistant_context(handoff)
     transcript = [
-        *_project_session_messages(session),
+        *(projected if projected is not None else _project_session_messages(session)),
         ProjectedMessage(role="user", text=prompt, timestamp=session.updated_at or session.created_at),
         ProjectedMessage(role="assistant", text=assistant_context, timestamp=session.updated_at or session.created_at),
     ]
@@ -553,8 +740,7 @@ def _write_codex(session: Session, home: Path, title: str, handoff: str, project
                 "cli_version": defaults["cli_version"],
                 "instructions": None,
                 "model_provider": defaults["model_provider"],
-                "model": defaults["model"],
-                "reasoning_effort": defaults["reasoning_effort"],
+                **_codex_model_fields(defaults, "model", "reasoning_effort"),
             },
         },
     ]
@@ -567,9 +753,8 @@ def _write_codex(session: Session, home: Path, title: str, handoff: str, project
             "payload": {
                 "cwd": cwd,
                 "approval_policy": defaults["approval_mode"],
-                "sandbox_policy": _codex_turn_context_sandbox_policy(defaults["sandbox_policy"]),
-                "model": defaults["model"],
-                "effort": defaults["reasoning_effort"],
+                "sandbox_policy": _codex_turn_context_sandbox_policy(str(defaults["sandbox_policy"])),
+                **_codex_model_fields(defaults, "model", "effort"),
                 "summary": display_title,
             },
         },
@@ -694,17 +879,26 @@ def _codex_token_count_row(timestamp: str, messages: list[ProjectedMessage]) -> 
     }
 
 
-def _codex_native_defaults(root: Path) -> dict[str, str]:
-    defaults = {
+def _codex_native_defaults(root: Path) -> dict[str, str | None]:
+    """Thread metadata an import needs so this machine's Codex lists and resumes it.
+
+    The provider must be the one Codex is configured for (config.toml, default
+    "openai"): Codex hides threads of other providers from its resume list and
+    refuses to resume a thread whose provider it does not know. Model and
+    reasoning effort stay NULL unless configured, so Codex resolves its current
+    default on resume instead of a stale model id.
+    """
+    settings = read_codex_settings(root)
+    defaults: dict[str, str | None] = {
         "source": "cli",
         "thread_source": "user",
-        "model_provider": "codex",
+        "model_provider": settings.get("model_provider") or DEFAULT_PROVIDER,
         "cli_version": "0.137.0",
-        "model": "gpt-5.5",
+        "model": settings.get("model"),
         "sandbox_policy": "workspace-write",
         "approval_mode": "on-request",
         "memory_mode": "enabled",
-        "reasoning_effort": "medium",
+        "reasoning_effort": settings.get("model_reasoning_effort"),
     }
     db_path = root / "state_5.sqlite"
     if not db_path.exists():
@@ -716,34 +910,39 @@ def _codex_native_defaults(root: Path) -> dict[str, str]:
         if not table:
             con.close()
             return defaults
-        row = con.execute(
-            """
-            SELECT source, thread_source, model_provider, cli_version, model, sandbox_policy,
-                   approval_mode, memory_mode, reasoning_effort
-            FROM threads
-            WHERE model_provider = 'codex'
-              AND model IS NOT NULL AND model <> ''
-              AND IFNULL(reasoning_effort, '') <> ''
-              AND rollout_path NOT LIKE '%-imported-%'
-              AND rollout_path NOT LIKE '%/sessions/imported/%'
-              AND instr(title, '[Imported from ') = 0
-            ORDER BY CASE WHEN source = 'cli' THEN 0 ELSE 1 END, updated_at DESC
-            LIMIT 1
-            """
-        ).fetchone()
+        available = {str(row[1]) for row in con.execute("PRAGMA table_info(threads)").fetchall()}
+        wanted = [column for column in ("cli_version", "sandbox_policy", "approval_mode", "memory_mode") if column in available]
+        filters = ["rollout_path NOT LIKE '%-imported-%'", "rollout_path NOT LIKE '%/sessions/imported/%'"]
+        if "title" in available:
+            filters.append("instr(title, '[Imported from ') = 0")
+        order = ["CASE WHEN source = 'cli' THEN 0 ELSE 1 END"] if "source" in available else []
+        if "updated_at" in available:
+            order.append("updated_at DESC")
+        row = None
+        if wanted and "rollout_path" in available:
+            row = con.execute(
+                f"SELECT {', '.join(wanted)} FROM threads WHERE {' AND '.join(filters)}"
+                + (f" ORDER BY {', '.join(order)}" if order else "")
+                + " LIMIT 1"
+            ).fetchone()
         con.close()
     except sqlite3.Error:
         return defaults
-    if not row:
-        return defaults
-    for key in defaults:
-        value = row[key]
-        if value not in (None, ""):
-            defaults[key] = str(value)
-    defaults["source"] = "cli"
-    defaults["thread_source"] = "user"
-    defaults["model_provider"] = "codex"
+    if row:
+        for key in row.keys():
+            if row[key] not in (None, ""):
+                defaults[key] = str(row[key])
     return defaults
+
+
+def _codex_model_fields(defaults: dict[str, str | None], model_key: str, effort_key: str) -> dict[str, str]:
+    """Model fields for session_meta/turn_context; omitted when unset (Codex then uses its default)."""
+    fields: dict[str, str] = {}
+    if defaults.get("model"):
+        fields[model_key] = str(defaults["model"])
+    if defaults.get("reasoning_effort"):
+        fields[effort_key] = str(defaults["reasoning_effort"])
+    return fields
 
 
 def _codex_rollout_path(root: Path, sid: str, when: int | None = None) -> Path:
@@ -882,7 +1081,7 @@ def _codex_turn_context_sandbox_policy(value: str) -> Any:
     return parsed
 
 
-def _upsert_codex_thread(root: Path, sid: str, title: str, rollout: Path, cwd: str, first_user_message: str, defaults: dict[str, str]) -> None:
+def _upsert_codex_thread(root: Path, sid: str, title: str, rollout: Path, cwd: str, first_user_message: str, defaults: dict[str, str | None]) -> None:
     db_path = root / "state_5.sqlite"
     if not db_path.exists():
         return
@@ -936,7 +1135,8 @@ def _upsert_codex_thread(root: Path, sid: str, title: str, rollout: Path, cwd: s
         return
 
 
-def _find_codex_imports_to_repair(root: Path) -> list[dict[str, Any]]:
+def _find_codex_imports_to_repair(root: Path, defaults: dict[str, str | None] | None = None) -> list[dict[str, Any]]:
+    defaults = defaults or _codex_native_defaults(root)
     db_path = root / "state_5.sqlite"
     index_titles = _codex_import_index_titles(root)
     raw_index_titles = _codex_import_index_titles(root, localize=False)
@@ -984,10 +1184,10 @@ def _find_codex_imports_to_repair(root: Path) -> list[dict[str, Any]]:
         needs_repair = (
             item.get("source") != "cli"
             or item.get("thread_source") != "user"
-            or item.get("model_provider") != "codex"
+            or item.get("model_provider") != defaults["model_provider"]
             or int(item.get("has_user_event") or 0) != 0
-            or not item.get("model")
-            or not item.get("reasoning_effort")
+            or (item.get("model") or None) != defaults["model"]
+            or (item.get("reasoning_effort") or None) != defaults["reasoning_effort"]
             or str(item.get("sandbox_policy") or "").strip() in {"", '{"type":"read-only"}'}
             or not _is_codex_v7_id(str(item["id"]))
             or _is_codex_imported_folder(root, Path(str(item["rollout_path"])))
@@ -1027,14 +1227,16 @@ def _localize_import_title_timezone(title: str) -> str:
 
 
 def _codex_rollout_has_duplicate_marker(path: Path) -> bool:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        return text.count(IMPORT_MARKER) + text.count(LEGACY_IMPORT_MARKER) > 1
-    except OSError:
-        return False
+    count = 0
+    for row in iter_jsonl(path):
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            continue
+        text = json.dumps(row.get("payload"), ensure_ascii=False)
+        count += text.count(IMPORT_MARKER) + text.count(LEGACY_IMPORT_MARKER)
+    return count > 1
 
 
-def _repair_codex_rollout_file(root: Path, row: dict[str, Any], defaults: dict[str, str]) -> Path:
+def _repair_codex_rollout_file(root: Path, row: dict[str, Any], defaults: dict[str, str | None]) -> Path:
     old_id = str(row["id"])
     new_id = str(row.get("new_id") or old_id)
     old_path = Path(str(row["rollout_path"]))
@@ -1056,13 +1258,18 @@ def _is_codex_imported_folder(root: Path, path: Path) -> bool:
         return False
 
 
-def _rewrite_codex_rollout_metadata(path: Path, defaults: dict[str, str], cwd: str, title: str, sid: str | None = None) -> None:
+def _rewrite_codex_rollout_metadata(path: Path, defaults: dict[str, str | None], cwd: str, title: str, sid: str | None = None) -> None:
     rows = [row for row in iter_jsonl(path)]
     handoff = _extract_codex_handoff(rows)
     prompt = _codex_import_user_prompt(_codex_import_prompt_title(title))
     assistant_context = _codex_import_assistant_context(handoff) if handoff else "Imported handoff context. Verify workspace state before continuing."
     assistant_context_payload = _codex_assistant_context_payload(rows)
+    # Old handoff-only imports have a single user turn holding the handoff; it is
+    # replaced by the title prompt. Structured transcripts keep every user turn.
+    handoff_only = _codex_user_message_count(rows) <= 1
     user_rewritten = False
+    model_fields = _codex_model_fields(defaults, "model", "reasoning_effort")
+    turn_model_fields = _codex_model_fields(defaults, "model", "effort")
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1076,31 +1283,46 @@ def _rewrite_codex_rollout_metadata(path: Path, defaults: dict[str, str], cwd: s
             payload["thread_source"] = defaults["thread_source"]
             payload["model_provider"] = defaults["model_provider"]
             payload["cli_version"] = defaults["cli_version"]
-            payload["model"] = defaults["model"]
-            payload["reasoning_effort"] = defaults["reasoning_effort"]
+            payload.pop("model", None)
+            payload.pop("reasoning_effort", None)
+            payload.update(model_fields)
         elif row.get("type") == "response_item" and isinstance(payload, dict) and payload.get("type") == "message":
             role = payload.get("role")
-            if role == "user" and not user_rewritten:
+            if role == "user" and handoff_only and not user_rewritten:
                 payload["content"] = [{"type": "input_text", "text": prompt}]
                 user_rewritten = True
-            elif role == "assistant" and payload is assistant_context_payload:
+            elif role == "assistant" and payload is assistant_context_payload and (handoff or handoff_only):
                 payload["content"] = [{"type": "output_text", "text": assistant_context}]
             elif role == "assistant":
                 _strip_codex_import_marker(payload)
         elif row.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "user_message":
-            payload["message"] = prompt
+            if handoff_only:
+                payload["message"] = prompt
             payload.setdefault("images", [])
         elif row.get("type") == "event_msg" and isinstance(payload, dict):
             _strip_codex_import_marker(payload)
         elif row.get("type") == "turn_context" and isinstance(payload, dict):
             payload["cwd"] = cwd
             payload["approval_policy"] = defaults["approval_mode"]
-            payload["sandbox_policy"] = _codex_turn_context_sandbox_policy(defaults["sandbox_policy"])
-            payload["model"] = defaults["model"]
-            payload["effort"] = defaults["reasoning_effort"]
+            payload["sandbox_policy"] = _codex_turn_context_sandbox_policy(str(defaults["sandbox_policy"]))
+            payload.pop("model", None)
+            payload.pop("effort", None)
+            payload.update(turn_model_fields)
             payload["summary"] = title
     if rows:
         write_jsonl(path, rows)
+
+
+def _codex_user_message_count(rows: list[Any]) -> int:
+    return sum(
+        1
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("type") == "response_item"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("type") == "message"
+        and row["payload"].get("role") == "user"
+    )
 
 
 def _codex_assistant_context_payload(rows: list[Any]) -> dict[str, Any] | None:
@@ -1143,7 +1365,7 @@ def _extract_codex_handoff(rows: list[Any]) -> str:
     return ""
 
 
-def _write_claude(session: Session, home: Path, title: str, handoff: str, project_path: str) -> str:
+def _write_claude(session: Session, home: Path, title: str, handoff: str, project_path: str, projected: list[ProjectedMessage] | None = None) -> str:
     root = resolve_paths(home).claude_home
     slug = project_to_claude_slug(project_path)
     project_dir = root / "projects" / slug
@@ -1151,12 +1373,20 @@ def _write_claude(session: Session, home: Path, title: str, handoff: str, projec
     sid = str(uuid.uuid4())
     path = project_dir / f"{sid}.jsonl"
     display_title = _codex_import_display_title(session, title)
-    _write_claude_session_rows(path, sid, display_title, handoff, project_path, session=session)
+    _write_claude_session_rows(path, sid, display_title, handoff, project_path, session=session, projected=projected)
     append_jsonl(root / "history.jsonl", {"display": display_title, "pastedContents": {}, "timestamp": int(time.time() * 1000), "project": project_path, "sessionId": sid})
     return f"Imported into Claude Code session {sid}\nBackup: {backup}\nSession file: {path}\n"
 
 
-def _write_claude_session_rows(path: Path, sid: str, title: str, handoff: str, project_path: str, session: Session | None = None) -> None:
+def _write_claude_session_rows(
+    path: Path,
+    sid: str,
+    title: str,
+    handoff: str,
+    project_path: str,
+    session: Session | None = None,
+    projected: list[ProjectedMessage] | None = None,
+) -> None:
     timestamp = now_iso()
     base = {
         "isSidechain": False,
@@ -1167,7 +1397,8 @@ def _write_claude_session_rows(path: Path, sid: str, title: str, handoff: str, p
         "version": _claude_native_version(path.parent.parent),
         "gitBranch": "HEAD",
     }
-    projected = _project_session_messages(session) if session else []
+    if projected is None:
+        projected = _project_session_messages(session) if session else []
     if not projected:
         projected = [
             ProjectedMessage(role="user", text=handoff, timestamp=None),
@@ -1328,6 +1559,7 @@ def _write_copilot(
     title: str,
     handoff: str,
     project_path: str,
+    projected: list[ProjectedMessage] | None = None,
     *,
     force_running_vscode: bool = False,
 ) -> str:
@@ -1338,7 +1570,7 @@ def _write_copilot(
     backup = backup_paths(home, [chat_dir, workspace / "state.vscdb", workspace / "state.vscdb.backup"])
     sid = str(uuid.uuid4())
     now_ms = int(time.time() * 1000)
-    requests = _copilot_projected_requests(session, handoff, now_ms)
+    requests = _copilot_projected_requests(session, handoff, now_ms, projected)
     created_ms = _source_timestamp_ms(session.created_at, now_ms)
     updated_ms = _source_timestamp_ms(session.updated_at, requests[-1]["timestamp"] if requests else now_ms)
     payload = {
@@ -1591,8 +1823,9 @@ def _real_user_home() -> Path:
     return Path.home()
 
 
-def _copilot_projected_requests(session: Session, handoff: str, now_ms: int) -> list[dict[str, Any]]:
-    projected = _project_session_messages(session)
+def _copilot_projected_requests(session: Session, handoff: str, now_ms: int, projected: list[ProjectedMessage] | None = None) -> list[dict[str, Any]]:
+    if projected is None:
+        projected = _project_session_messages(session)
     if not projected:
         return [
             _copilot_request(

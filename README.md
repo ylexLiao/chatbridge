@@ -26,8 +26,10 @@ It does not call a cloud service by default. It reads and writes local history f
 
 - Browse recovered Copilot, Codex, and Claude Code sessions without loading every full transcript.
 - Generate handoff prompts when you want another agent to continue.
-- Native-import sessions into the target tool's local history format.
-- Export a session as a portable JSON bundle and import it on another machine (for example over SSH).
+- Native-import sessions into the target tool's local history format, sized to fit the target's context window.
+- Keep the work, not just the chat: shell commands with their output, file edits as diffs, web and MCP calls travel with the session.
+- Export a session as a portable JSON bundle and import it on another machine (for example over SSH), from the CLI or the TUI.
+- Preview what a session or bundle contains (turns, tool calls, files touched) before importing it.
 - Repair old imports that are missing index, cache, or JSONL files.
 - Diagnose local history paths for VS Code, Insiders, VSCodium, Cursor, Codex, and Claude Code.
 - Replace embedded image base64 with readable attachment placeholders instead of dumping huge text into chats.
@@ -170,6 +172,28 @@ chatbridge export --from copilot --session <session-id>
 chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to claude --apply
 ```
 
+See what is inside a session or bundle, and find bundles on this machine:
+
+```bash
+chatbridge preview --from codex --session <session-id>
+chatbridge preview --bundle chatbridge-export-codex-<session-id>.json
+chatbridge bundles
+```
+
+## TUI
+
+Run `chatbridge` with no arguments. `Tab` switches the source tool; the actions are:
+
+| Key | Action |
+| --- | --- |
+| `L` | View recent sessions; `Enter` shows turns, tool calls and files touched |
+| `H` | Prompt handoff for another agent |
+| `N` | Native import into another tool, or `Export bundle (.json)` |
+| `I` | Import a JSON bundle (lists bundles in `~/.chatbridge/exports/`, the current directory, `~/Downloads` and `~`, or type a path) |
+| `P` | Paths and setup |
+
+Before an import is written you get a preview and a confirm step with `Dry run` / `Apply`; press `E` there to import into a different project (useful when a bundle from another machine points at a folder that does not exist here). In result views `PgUp`/`PgDn` page through long output and `C` copies it to the clipboard through OSC 52 (in tmux, enable `set -g set-clipboard on`). The TUI follows your locale (`zh_*` shows Chinese); `T` toggles the language and `CHATBRIDGE_LANG=en|zh` forces one.
+
 ## Supported Sources And Targets
 
 | Tool | Read | Native import target | Local state |
@@ -207,9 +231,11 @@ CHATBRIDGE_API_TIMEOUT=120
 
 ChatBridge writes target-native files instead of only dropping a summary into plain text.
 
-- Codex imports write rollout JSONL plus visible `state_5.sqlite`, `session_index.jsonl`, and `history.jsonl` rows.
+- Codex imports write rollout JSONL plus visible `state_5.sqlite`, `session_index.jsonl`, and `history.jsonl` rows. The thread is tagged with the model provider from `~/.codex/config.toml` (`model_provider`, or the active `profile`'s; default `openai`), because Codex only lists and resumes threads of the provider it is configured for. The model stays unset unless `config.toml` names one, so Codex uses its current default when you resume.
 - Claude Code imports write chained project transcript rows plus `history.jsonl`.
 - Copilot imports write VS Code `chatSessions/*.jsonl` and `.json`, `chat.ChatSessionStore.index`, and Agent Sessions cache entries.
+
+Tool calls are imported as readable fenced blocks inside the assistant turns (`[Tool: shell] $ npm test` followed by the output). Long sessions are trimmed to an approximate token budget so the target can still resume them: older tool output is shortened first, then older tool calls are left out, then older long messages are shortened; the conversation itself is kept as long as possible. The budget follows `--level` (`brief` ~20K, `normal` ~60K, `full` ~120K tokens; the TUI uses `full`). Dry runs and imports print exactly what was trimmed. Use `--max-tokens N` to pick a budget, or `--max-tokens 0` to import everything.
 
 For Copilot imports, fully quit all VS Code windows before using `--apply`. VS Code keeps chat indexes in memory and may overwrite offline writes when it exits.
 
@@ -221,6 +247,12 @@ chatbridge repair-claude-imports --apply
 chatbridge repair-copilot-imports --apply
 ```
 
+### Codex compatibility
+
+Imports are checked against Codex 0.137 through 0.164. ChatBridge 1.0.x tagged Codex imports with a provider named `codex`, which Codex does not know unless your `config.toml` defines `[model_providers.codex]`; those threads are missing from `codex resume` and fail with ``Model provider `codex` not found``. Run `chatbridge repair-codex-imports --apply` once to retag them with your current provider (it keeps every imported turn).
+
+Codex 0.153 and later store sessions in a new ("paginated") rollout format; ChatBridge reads both formats, including commands, patches and their output. Sessions listed with scope `PROMPTS` only have the prompts recorded in `history.jsonl` (the transcript file is gone or lives in another Codex home), so exporting them yields just those prompts.
+
 ## Export Bundles And Remote Machines
 
 `chatbridge export` writes one session to a portable JSON bundle (`"format": "chatbridge-bundle"`, `"version": 1`):
@@ -230,7 +262,9 @@ chatbridge export --from copilot --session <session-id>
 # -> ./chatbridge-export-copilot-<session-id>.json  (use --out PATH to change it)
 ```
 
-The bundle stores the session metadata (source, title, project path, timestamps) plus its messages and artifacts. Text is redacted and embedded base64 images are replaced with placeholders before the file is written, so the bundle is safe to move between machines. In the TUI, every source offers an `Export bundle (.json)` option in the target picker.
+The bundle stores the session metadata (source, title, project path, timestamps), a `stats` summary, and the messages in order, including tool calls (`"role": "tool"`, with the command or diff and its output) and artifacts. Text is redacted and embedded base64 images are replaced with placeholders before the file is written, so the bundle is safe to move between machines. Very large tool outputs are clipped (the start and end are kept); file diffs are kept up to 20K characters each. Bundles from ChatBridge 1.0.x still import.
+
+In the TUI, every source offers an `Export bundle (.json)` option in the target picker; it writes to `~/.chatbridge/exports/` (not your current directory, which is often a git repository). On the other machine, put the file in `~/.chatbridge/exports/`, `~/Downloads`, `~` or the directory you start `chatbridge` from, then press `I`.
 
 To continue a local session on a remote machine (Remote SSH and similar):
 
@@ -244,6 +278,7 @@ scp chatbridge-export-copilot-<session-id>.json remote:
 # 3. Remote machine: import the bundle natively (no source history needed there)
 chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to codex --apply
 chatbridge native-import --bundle chatbridge-export-copilot-<session-id>.json --to claude --apply
+# ...or run `chatbridge` there and press I
 ```
 
 When the bundled session's project is a `vscode-remote://` URI, importing to Codex or Claude Code automatically translates it to the remote filesystem path (for example `vscode-remote://ssh-remote%2Bbox/home/ubuntu/app` becomes `/home/ubuntu/app`). Pass `--project` to override the destination project.
@@ -277,6 +312,15 @@ npm test
 npm run test:rust
 npm run build:tui
 npm pack --dry-run
+```
+
+Check Codex imports against real Codex binaries (throwaway `CODEX_HOME`, no model calls, never touches `~/.codex`):
+
+```bash
+python3 scripts/codex_compat_check.py --codex-bin "$(which codex)"
+npm install --prefix /tmp/codex-0.137 @openai/codex@0.137.0
+python3 scripts/codex_compat_check.py --codex-bin /tmp/codex-0.137/node_modules/.bin/codex
+CHATBRIDGE_CODEX_BIN="$(which codex)" npm test   # runs the same check as a unit test
 ```
 
 ## Acknowledgments

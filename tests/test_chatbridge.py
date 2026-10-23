@@ -453,8 +453,10 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertEqual(rows[0]["type"], "session_meta")
             self.assertEqual(rows[0]["payload"]["source"], "cli")
             self.assertEqual(rows[0]["payload"]["thread_source"], "user")
-            self.assertEqual(rows[0]["payload"]["model_provider"], "codex")
+            # No config.toml: Codex's default provider, so the import is listed and resumable.
+            self.assertEqual(rows[0]["payload"]["model_provider"], "openai")
             self.assertEqual(rows[0]["payload"]["cli_version"], "0.137.0")
+            self.assertNotIn("model", rows[0]["payload"])
             response_messages = [row["payload"] for row in rows if row.get("type") == "response_item" and row.get("payload", {}).get("type") == "message"]
             user_texts = [msg["content"][0]["text"] for msg in response_messages if msg.get("role") == "user"]
             assistant_texts = [msg["content"][0]["text"] for msg in response_messages if msg.get("role") == "assistant"]
@@ -477,7 +479,8 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertTrue(any(payload.get("type") == "user_message" and "[Copilot last query]" in payload.get("message", "") for payload in event_payloads))
             self.assertTrue(any(payload.get("type") == "agent_message" and "[Copilot last reply]" in payload.get("message", "") for payload in event_payloads))
             self.assertEqual(rows[-1]["type"], "turn_context")
-            self.assertEqual(rows[-1]["payload"]["model"], "gpt-5.5")
+            # Unset model: Codex resolves its configured default when the thread is resumed.
+            self.assertNotIn("model", rows[-1]["payload"])
             session_index_text = (home / ".codex/session_index.jsonl").read_text(encoding="utf-8")
             self.assertIn("[Imported from Copilot]", session_index_text)
             self.assertIn("Copilot started 2023-11-15 06:13", session_index_text)
@@ -495,8 +498,8 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertNotIn("-imported-", Path(db_rows[0][2]).name)
             self.assertEqual(db_rows[0][3], "cli")
             self.assertEqual(db_rows[0][4], "user")
-            self.assertEqual(db_rows[0][5], "codex")
-            self.assertEqual(db_rows[0][6], "gpt-5.5")
+            self.assertEqual(db_rows[0][5], "openai")
+            self.assertIsNone(db_rows[0][6])
             self.assertEqual(db_rows[0][7], "0.137.0")
             self.assertEqual(db_rows[0][8], 0)
             self.assertIn("Copilot started 2023-11-15 06:13", db_rows[0][1])
@@ -1327,7 +1330,7 @@ class ChatbridgeTests(unittest.TestCase):
             self.assertNotIn("-imported-", Path(row[2]).name)
             self.assertEqual(row[3], "cli")
             self.assertEqual(row[4], "user")
-            self.assertEqual(row[5], "codex")
+            self.assertEqual(row[5], "openai")
             self.assertEqual(row[6], 0)
             self.assertEqual(row[7], title)
             repaired_rows = [json.loads(line) for line in Path(row[2]).read_text(encoding="utf-8").splitlines()]

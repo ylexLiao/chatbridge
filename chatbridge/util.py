@@ -99,6 +99,14 @@ def write_jsonl(path: Path, rows: Iterable[Any]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def approx_tokens(text: str) -> int:
+    """Cheap token estimate: ~4 ASCII chars per token, ~1 token per CJK/other char."""
+    if not text:
+        return 0
+    ascii_count = sum(1 for ch in text if ord(ch) < 128)
+    return (ascii_count + 3) // 4 + (len(text) - ascii_count)
+
+
 def redact(text: str) -> str:
     safe = text
     for pattern, mode in SECRET_PATTERNS:

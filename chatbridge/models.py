@@ -10,6 +10,8 @@ class Message:
     role: str
     text: str
     timestamp: str | int | float | None = None
+    # Tool name for role == "tool" messages (a rendered tool call plus its output).
+    tool: str | None = None
 
 
 @dataclass

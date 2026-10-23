@@ -7,10 +7,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .export import load_bundle, write_bundle
+from .export import bundle_search_dirs, default_export_dir, list_bundles, load_bundle, write_bundle
 from .models import Session
 from .parsers import SUPPORTED_SOURCES, count_sessions, find_session, load_sessions
-from .paths import path_doctor, set_path_overrides
+from .paths import path_doctor, path_probes, set_path_overrides
+from .preview import TRANSCRIPT_MISSING_NOTE, session_preview
 from .summary import build_handoff
 from .util import timestamp_sort_key
 from .writers import NativeImportError, native_import
@@ -43,9 +44,19 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     native_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
     native_cmd.add_argument("--allow-duplicate", action="store_true")
     native_cmd.add_argument("--force", action="store_true")
+    native_cmd.add_argument("--max-tokens", type=int)
     mode = native_cmd.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--apply", action="store_true")
+
+    preview_cmd = api_sub.add_parser("preview", help="Summarize a session or bundle (counts, files, first/last turns) as JSON.")
+    preview_cmd.add_argument("--from", dest="source", choices=sorted(SUPPORTED_SOURCES))
+    preview_cmd.add_argument("--session")
+    preview_cmd.add_argument("--bundle")
+    preview_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="full")
+
+    bundles_cmd = api_sub.add_parser("bundles", help="List ChatBridge bundle files found in the usual places as JSON.")
+    bundles_cmd.add_argument("--dir", action="append", default=[], help="Extra directory to search (repeatable).")
 
     export_cmd = api_sub.add_parser("export", help="Export a session to a portable bundle as JSON.")
     export_cmd.add_argument("--from", dest="source", required=True, choices=sorted(SUPPORTED_SOURCES))
@@ -56,6 +67,7 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     paths_cmd = api_sub.add_parser("paths", help="Inspect configured history paths as JSON.")
     paths_sub = paths_cmd.add_subparsers(dest="paths_command", required=True)
     paths_sub.add_parser("doctor")
+    paths_sub.add_parser("status")
     paths_set = paths_sub.add_parser("set")
     paths_set.add_argument("--copilot-workspace-storage")
     paths_set.add_argument("--codex-home")
@@ -93,8 +105,11 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
             return _write_ok({"text": build_handoff(session, args.target, args.level)})
         if args.api_command == "export":
             session = find_session(args.source, home, args.session, args.project)
-            bundle_path = write_bundle(session, Path(args.out).expanduser() if args.out else None)
-            return _write_ok({"text": f"Exported {session.source_label} session {session.session_id} to {bundle_path}"})
+            bundle_path = write_bundle(session, args.out or None)
+            text = f"Exported {session.source_label} session {session.session_id} to {bundle_path}"
+            if (session.metadata or {}).get("transcript") == "missing":
+                text += f"\nWarning: {TRANSCRIPT_MISSING_NOTE}"
+            return _write_ok({"text": text})
         if args.api_command == "native-import":
             if args.bundle:
                 session = load_bundle(Path(args.bundle))
@@ -111,8 +126,36 @@ def handle_api(args: argparse.Namespace, home: Path) -> int:
                 level=args.level,
                 allow_duplicate=bool(args.allow_duplicate),
                 force_running_vscode=bool(args.force),
+                max_tokens=args.max_tokens,
             )
             return _write_ok({"text": text})
+        if args.api_command == "preview":
+            if args.bundle:
+                session = load_bundle(Path(args.bundle))
+            elif args.source:
+                session = find_session(args.source, home, args.session, None)
+            else:
+                raise SystemExit("Provide --from SOURCE --session ID or --bundle FILE.")
+            return _write_ok(session_preview(session, level=args.level))
+        if args.api_command == "bundles":
+            dirs = bundle_search_dirs(home) + [Path(value).expanduser() for value in args.dir]
+            return _write_ok(
+                {
+                    "bundles": list_bundles(dirs),
+                    "dirs": [str(path) for path in dirs],
+                    "exportDir": str(default_export_dir(home)),
+                }
+            )
+        if args.api_command == "paths" and args.paths_command == "status":
+            sources = {"copilot_workspace_storage": "copilot", "codex_home": "codex", "claude_home": "claude"}
+            return _write_ok(
+                {
+                    "sources": [
+                        {"source": sources.get(probe.key, probe.key), "label": probe.label, "path": str(probe.active), "exists": probe.exists}
+                        for probe in path_probes(home)
+                    ]
+                }
+            )
         if args.api_command == "paths" and args.paths_command == "doctor":
             return _write_ok({"text": path_doctor(home)})
         if args.api_command == "paths" and args.paths_command == "set":
@@ -149,6 +192,8 @@ def _session_to_api(session: Session, source: str) -> dict[str, Any]:
 
 
 def _session_scope(session: Session, source: str) -> str:
+    if (session.metadata or {}).get("transcript") == "missing":
+        return "PROMPTS"  # only the typed prompts survive; no transcript file
     if source != "copilot" and session.source != "copilot":
         return ""
     project = session.project_path or ""

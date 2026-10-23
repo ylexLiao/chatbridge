@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from . import __version__
-from .export import load_bundle, write_bundle
+from .export import bundle_search_dirs, list_bundles, load_bundle, write_bundle
+from .preview import TRANSCRIPT_MISSING_NOTE, render_preview_text, session_preview
 from .parsers import SUPPORTED_SOURCES, find_session, load_sessions
 from .paths import edit_path_overrides, path_doctor, set_path_overrides
 from .summary import build_handoff
@@ -60,9 +62,25 @@ def main(argv: list[str] | None = None) -> int:
     native_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal")
     native_cmd.add_argument("--allow-duplicate", action="store_true", help="Import another copy when a matching native import already exists, suffixing the title.")
     native_cmd.add_argument("--force", action="store_true", help="For Copilot imports, write even if VS Code is running and may overwrite the import.")
+    native_cmd.add_argument(
+        "--max-tokens",
+        type=int,
+        help="Approximate token budget for the imported transcript; older tool output and messages are trimmed first. "
+        "Default depends on --level (brief 20000, normal 60000, full 120000). 0 imports everything.",
+    )
     mode = native_cmd.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Show what would be imported without writing. Default.")
     mode.add_argument("--apply", action="store_true", help="Write the imported synthetic session after creating backups.")
+
+    preview_cmd = sub.add_parser("preview", help="Show what a session or bundle contains (turns, tool calls, files touched).")
+    preview_cmd.add_argument("--from", dest="source", choices=sorted(SUPPORTED_SOURCES))
+    preview_cmd.add_argument("--session")
+    preview_cmd.add_argument("--project")
+    preview_cmd.add_argument("--bundle", help="Preview a ChatBridge export bundle instead of a local session.")
+    preview_cmd.add_argument("--level", choices=["brief", "normal", "full"], default="normal", help="Level used for the import size estimate.")
+    preview_cmd.add_argument("--json", action="store_true", help="Print the preview as JSON.")
+
+    sub.add_parser("bundles", help="List ChatBridge bundles in ~/.chatbridge/exports, the current directory, ~/Downloads and ~.")
 
     repair_cmd = sub.add_parser("repair-codex-imports", help="Repair older ChatBridge Codex imports so Codex resume can see them.")
     repair_mode = repair_cmd.add_mutually_exclusive_group()
@@ -109,8 +127,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "export":
             session = find_session(args.source, home, args.session, args.project)
-            bundle_path = write_bundle(session, Path(args.out).expanduser() if args.out else None)
+            bundle_path = write_bundle(session, args.out or None)
             print(f"Exported {session.source_label} session {session.session_id} to {bundle_path}")
+            if (session.metadata or {}).get("transcript") == "missing":
+                print(f"Warning: {TRANSCRIPT_MISSING_NOTE}", file=sys.stderr)
             return 0
         if args.command == "native-import":
             if args.bundle:
@@ -129,8 +149,32 @@ def main(argv: list[str] | None = None) -> int:
                     level=args.level,
                     allow_duplicate=bool(args.allow_duplicate),
                     force_running_vscode=bool(args.force),
+                    max_tokens=args.max_tokens,
                 )
             )
+            return 0
+        if args.command == "preview":
+            if args.bundle:
+                session = load_bundle(Path(args.bundle))
+            elif args.source:
+                session = find_session(args.source, home, args.session, args.project)
+            else:
+                raise SystemExit("Provide --from SOURCE [--session ID] or --bundle FILE.")
+            preview = session_preview(session, level=args.level)
+            if args.json:
+                sys.stdout.write(json.dumps(preview, ensure_ascii=False, indent=2) + "\n")
+            else:
+                sys.stdout.write(render_preview_text(preview))
+            return 0
+        if args.command == "bundles":
+            rows = list_bundles(bundle_search_dirs(home))
+            if not rows:
+                print("No ChatBridge bundles found in: " + ", ".join(str(path) for path in bundle_search_dirs(home)))
+                return 0
+            for row in rows:
+                stats = row.get("stats") or {}
+                counts = f"{stats.get('messages', '?')} msgs, {stats.get('toolCalls', '?')} tools" if stats else "-"
+                print(f"{row['path']}\t{row.get('source') or '?'}\t{row.get('title') or ''}\t{counts}")
             return 0
         if args.command == "repair-codex-imports":
             sys.stdout.write(repair_codex_imports(home, apply=bool(args.apply)))
